@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "picogremlin-la"
+version = "1.0.0"
+description = "Host tools for the PicoGremlin logic analyzer: la CLI + Qt oscilloscope GUI"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "GPL-3.0-only"}
+authors = [
+  {name = "Gergely Sebestyen"},
+  {name = "Jozsef Kopjak"},
+]
+keywords = ["logic-analyzer", "oscilloscope", "rp2350", "pico", "debug-probe"]
+classifiers = [
+  "Development Status :: 5 - Production/Stable",
+  "Environment :: Console",
+  "Environment :: X11 Applications :: Qt",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Topic :: System :: Hardware",
+]
+dependencies = []
+
+[project.optional-dependencies]
+gui = ["PyQt6>=6.5", "pyqtgraph>=0.13", "numpy"]
+plot = ["matplotlib"]
+
+[project.scripts]
+la = "picogremlin_la.cli:main"
+la-gui = "picogremlin_la.gui:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
