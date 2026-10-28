@@ -355,6 +355,7 @@ class ScopeWindow(QtWidgets.QMainWindow):
         self.n = 0
         self.t0 = 0.0
         self.rate_meas = 0.0
+        self.loss = False
         self.rate_t = 0.0
         self.rate_n = 0
         self.frames = 0
@@ -1277,6 +1278,7 @@ class ScopeWindow(QtWidgets.QMainWindow):
         self.running = True
         self.n = self.frames = 0
         self.rate_meas = 0.0
+        self.loss = False
         self.rate_t = 0.0
         self.t0 = time.monotonic()
         self.stopflag = threading.Event()
@@ -1335,6 +1337,9 @@ class ScopeWindow(QtWidgets.QMainWindow):
             except Exception:
                 pass
         self.running = False
+        if self.loss:
+            self.loss = False
+            self._refresh_meas()
 
     def _auto_restart(self, *_):
         """Rate/channels define the stream: restart on change (debounced)."""
@@ -1381,6 +1386,17 @@ class ScopeWindow(QtWidgets.QMainWindow):
         post = min(max(ms - pre, self.sb_post.minimum()), self.sb_post.maximum())
         self.sb_pre.setValue(pre)
         self.sb_post.setValue(post)
+
+    def _check_loss(self):
+        """The 0x43 sample stream has no timestamps/sequence: if the probe's double
+        buffer overruns (host too slow), halves are overwritten and time is silently
+        compressed. The device samples at self.rate, so receiving materially fewer
+        samples per second than that is a reliable loss signal."""
+        lost = bool(self.rate and self.rate_meas and
+                    self.rate_meas < 0.90 * self.rate)
+        if lost != self.loss:
+            self.loss = lost
+            self._refresh_meas()
 
     def _restart_stream(self):
         if not self.running:
@@ -1561,6 +1577,7 @@ class ScopeWindow(QtWidgets.QMainWindow):
         if self.rate_t and now - self.rate_t > 1.0:
             self.rate_meas = (n - self.rate_n) / (now - self.rate_t)
             self.rate_t, self.rate_n = now, n
+            self._check_loss()
         elif not self.rate_t:
             self.rate_t, self.rate_n = now, n
         # The detector only ever sees NEW samples. Feeding it the whole ring every
@@ -1646,7 +1663,8 @@ class ScopeWindow(QtWidgets.QMainWindow):
             disp = "trigger-aligned" if aligned else "free-run"
         self.status.showMessage(
             f"{self.rate_meas / 1e3:.1f} kHz measured · {frames} frames · "
-            f"{n} samples · {disp}")
+            f"{n} samples · {disp}"
+            + (" · ⚠ DATA LOSS — timing unreliable" if self.loss else ""))
 
     def _draw(self, view, x, bits):
         n = len(self.chans)
@@ -1803,6 +1821,9 @@ class ScopeWindow(QtWidgets.QMainWindow):
             parts.append(s)
         if self._hover_text:
             parts.append(self._hover_text)
+        if self.loss:
+            parts.append('<span style="color:#f85149">⚠ data loss — timing unreliable '
+                         f'({self.rate_meas / 1e3:.0f} of {self.rate / 1e3:.0f} kS/s)</span>')
         if not parts:
             parts.append('<span style="color:#8b949e">cursors off — Shift-click = A, '
                          'Ctrl-click = B · hover the plot for edge timings</span>')

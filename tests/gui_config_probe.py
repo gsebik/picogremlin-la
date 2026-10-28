@@ -59,6 +59,20 @@ win._window_changed()
 print("shrink ring:", win.ring_cap, "win_samples:", win.win_samples, "restarts:", calls)
 assert win.win_samples == 500 and calls == []
 
+# --- data-loss detection: the sample stream has no timestamps, so a slower
+#     received rate than requested means the probe buffer overran (compressed time)
+win.rate, win.rate_meas = 100_000, 96_000
+win._check_loss()
+assert not win.loss, "96% is within tolerance"
+win.rate_meas = 60_000
+win._check_loss()
+print("loss       :", win.loss, "|", win.meas_lbl.text()[:40])
+assert win.loss
+assert "data loss" in win.meas_lbl.text().lower()
+win.rate_meas = 0
+win._check_loss()
+assert not win.loss
+
 # --- single-shot pre/post scale with the timebase (same ratio)
 win.running = False
 win._win_ms = 500.0

@@ -94,6 +94,13 @@ and, when the firmware answers CMD 0x40, the `PICOGREMLIN:` / `STREAM:` /
 stock-protocol LogicAnalyzer device; streaming needs PicoGremlin firmware.
 The protocol is documented in the firmware repository (`docs/LA_PROTOCOL.md`).
 
+> If the bar under the plot shows **⚠ data loss**, the probe's double buffer
+> overran (the PC could not drain the USB stream fast enough). The sampled
+> stream carries **no timestamps**, so time would be silently compressed and
+> periods/widths would be wrong — lower the rate or close CPU-heavy apps on the
+> PC.  (The firmware also has a hardware-timestamped edge stream, CMD 0x48, but
+> the GUI's live view uses the sampled stream today.)
+
 ## Development
 
 ```bash
