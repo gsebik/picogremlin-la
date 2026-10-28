@@ -76,7 +76,9 @@ la gui                                 # Qt GUI (needs the [gui] extra)
 - **Window** changes apply instantly: the history ring grows in place, so wheel
   zoom (and typing a window) never stops the stream. **Rate** and **channels**
   reconfigure the probe, so those restart the stream automatically (300 ms
-  debounce) — no manual Stop/Run round trip.
+  debounce) — no manual Stop/Run round trip. Single-shot **pre/post** follow the
+  timebase (pre+post = window, same split), so a capture covers exactly what you
+  are looking at.
 
 The probe is picked via `PICOGREMLIN_SERIAL` (else the only one attached).
 Channel *k* is GPIO (2+k): GP16/GP17 are channels 14/15, channels 21-23 are

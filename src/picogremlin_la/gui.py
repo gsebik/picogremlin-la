@@ -379,6 +379,7 @@ class ScopeWindow(QtWidgets.QMainWindow):
         self._hover_bit = 0
         self._hover_text = ""
         self.win_samples = 0
+        self._win_ms = None
         self.ring_cap = 0
         self.ring_pos = 0
         self.ring_total = 0
@@ -490,6 +491,7 @@ class ScopeWindow(QtWidgets.QMainWindow):
         tb.addWidget(QtWidgets.QLabel("  single: pre "))
         self.sb_pre = QtWidgets.QDoubleSpinBox()
         self.sb_pre.setRange(0, 1000)
+        self.sb_pre.setDecimals(4)
         self.sb_pre.setSingleStep(0.1)
         self.sb_pre.setValue(0.5)
         self.sb_pre.setSuffix(" ms")
@@ -500,6 +502,7 @@ class ScopeWindow(QtWidgets.QMainWindow):
         tb.addWidget(QtWidgets.QLabel(" post "))
         self.sb_post = QtWidgets.QDoubleSpinBox()
         self.sb_post.setRange(0.001, 5000)
+        self.sb_post.setDecimals(4)
         self.sb_post.setSingleStep(0.1)
         self.sb_post.setValue(4.9)
         self.sb_post.setSuffix(" ms")
@@ -1160,6 +1163,10 @@ class ScopeWindow(QtWidgets.QMainWindow):
                     self.cb_trig.setCurrentIndex(i)
                     break
         self._pins_changed()
+        try:
+            self._win_ms = float(self.cb_win.currentText())
+        except ValueError:
+            self._win_ms = None
 
     def _save_cfg(self):
         self.cfg.setValue("geometry", self.saveGeometry())
@@ -1252,6 +1259,7 @@ class ScopeWindow(QtWidgets.QMainWindow):
         win_samples = min(max(int(win_ms / 1000.0 * rate), 64), 2_000_000)
         self.rate = rate
         self.win_samples = win_samples
+        self._win_ms = win_ms
         event_ms = (self.sb_pre.value()
                     + max(self.sb_post.value(), 50.0) + 100.0)
         self.ring_cap = max(2 * win_samples,
@@ -1340,6 +1348,10 @@ class ScopeWindow(QtWidgets.QMainWindow):
             ms = float(self.cb_win.currentText())
         except ValueError:
             return
+        prev = self._win_ms
+        if prev and prev > 0 and ms > 0 and abs(ms - prev) > 1e-12:
+            self._scale_pre_post(ms)
+        self._win_ms = ms
         if not self.running:
             return
         # 4M samples = 16 MB for the window; the ring caps at 8M (32 MB).
@@ -1352,6 +1364,23 @@ class ScopeWindow(QtWidgets.QMainWindow):
         shown = self.win_samples / self.rate * 1e3 if self.rate else ms
         self.status.showMessage(
             f"window {shown:.4g} ms" + ("  (memory limit)" if shown < ms * 0.999 else ""))
+
+    def _scale_pre_post(self, ms):
+        """Keep the single-shot capture on the timebase: pre+post = window.
+
+        The split (pre:post) is kept, so the trigger stays at the same relative
+        position.  Otherwise a 0.5 ms pre/4.9 ms post stays fixed while the window
+        shrinks to microseconds: the single-shot then captures 5 ms of data and the
+        part you were looking at is a sliver on screen (and auto-fit drops the rate).
+        """
+        if ms <= 0:
+            return
+        total = self.sb_pre.value() + self.sb_post.value()
+        share = (self.sb_pre.value() / total) if total > 0 else 0.5
+        pre = min(max(ms * share, self.sb_pre.minimum()), self.sb_pre.maximum())
+        post = min(max(ms - pre, self.sb_post.minimum()), self.sb_post.maximum())
+        self.sb_pre.setValue(pre)
+        self.sb_post.setValue(post)
 
     def _restart_stream(self):
         if not self.running:

@@ -59,6 +59,22 @@ win._window_changed()
 print("shrink ring:", win.ring_cap, "win_samples:", win.win_samples, "restarts:", calls)
 assert win.win_samples == 500 and calls == []
 
+# --- single-shot pre/post scale with the timebase (same ratio)
+win.running = False
+win._win_ms = 500.0
+win.sb_pre.setValue(0.5)
+win.sb_post.setValue(4.9)
+win.cb_win.setCurrentText("5")
+win._window_changed()
+print("pre/post @5ms  : %.4f / %.4f ms" % (win.sb_pre.value(), win.sb_post.value()))
+assert abs(win.sb_pre.value() + win.sb_post.value() - 5.0) < 1e-3
+assert abs(win.sb_pre.value() / 5.0 - 0.5 / 5.4) < 1e-4, win.sb_pre.value()
+win.cb_win.setCurrentText("500")
+win._window_changed()
+print("pre/post @500ms: %.4f / %.4f ms" % (win.sb_pre.value(), win.sb_post.value()))
+assert abs(win.sb_pre.value() + win.sb_post.value() - 500.0) < 1e-3
+assert abs(win.sb_pre.value() / 500.0 - 0.5 / 5.4) < 1e-4, win.sb_pre.value()
+
 # --- and nothing restarts while stopped
 calls.clear()
 win.running = False
