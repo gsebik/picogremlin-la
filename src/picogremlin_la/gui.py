@@ -469,8 +469,8 @@ class ScopeWindow(QtWidgets.QMainWindow):
         self.cb_win.addItems(["0.5", "1", "2", "5", "10", "20", "50", "100", "200",
                               "500", "1000", "2000", "5000"])
         self.cb_win.setFixedWidth(70)
-        self.cb_win.activated.connect(self._auto_restart)
-        self.cb_win.lineEdit().editingFinished.connect(self._auto_restart)
+        self.cb_win.activated.connect(self._window_changed)
+        self.cb_win.lineEdit().editingFinished.connect(self._window_changed)
         tb.addWidget(self.cb_win)
 
         tb.addWidget(QtWidgets.QLabel("  trigger "))
@@ -799,7 +799,10 @@ class ScopeWindow(QtWidgets.QMainWindow):
     def _ring_slice(self, a0, a1):
         """Samples for absolute indices [a0, a1) — None when already gone."""
         with self.lock:
-            total, pos, cap = self.ring_total, self.ring_pos, self.ring_cap
+            return self._ring_slice_unlocked(a0, a1)
+
+    def _ring_slice_unlocked(self, a0, a1):
+        total, pos, cap = self.ring_total, self.ring_pos, self.ring_cap
         a0 = max(a0, total - cap, 0)
         a1 = min(a1, total)
         if a1 <= a0:
@@ -809,6 +812,35 @@ class ScopeWindow(QtWidgets.QMainWindow):
         if i0 + cnt <= cap:
             return self.ring[i0:i0 + cnt].copy()
         return np.concatenate((self.ring[i0:], self.ring[:(i0 + cnt) % cap]))
+
+    def _grow_ring(self, need):
+        """Grow the history ring in place (no stream restart) keeping absolute indices.
+
+        The window is a display parameter; reallocating + copying the last `have`
+        samples costs a few ms, so a larger window applies immediately instead of
+        stopping and restarting the probe.
+        """
+        need = min(need, 8_000_000)                 # 32 MB of uint32, hard cap
+        with self.lock:
+            cap = self.ring_cap
+            if need <= cap:
+                return True
+            newcap = min(max(need, cap * 2), 8_000_000)
+            total = self.ring_total
+            have = min(total, cap)
+            hist = self._ring_slice_unlocked(total - have, total) if have else None
+            new = np.zeros(newcap, dtype=np.uint32)
+            if have and hist is not None:
+                end = total % newcap
+                start = (end - have) % newcap
+                if start + have <= newcap:
+                    new[start:start + have] = hist
+                else:
+                    k = newcap - start
+                    new[start:] = hist[:k]
+                    new[:have - k] = hist[k:]
+            self.ring, self.ring_cap, self.ring_pos = new, newcap, total % newcap
+            return True
 
     def _feed_detector(self, n):
         """Look for finished bursts; measure + store + freeze the display."""
@@ -1240,7 +1272,8 @@ class ScopeWindow(QtWidgets.QMainWindow):
         self.rate_t = 0.0
         self.t0 = time.monotonic()
         self.stopflag = threading.Event()
-        self.thread = threading.Thread(target=self._reader, args=(bps,), daemon=True)
+        self.thread = threading.Thread(target=self._reader,
+                                       args=(bps, self.stopflag), daemon=True)
         self.thread.start()
         if self.btn_collect.isChecked():
             self._arm_detector()
@@ -1248,9 +1281,11 @@ class ScopeWindow(QtWidgets.QMainWindow):
         msg = f"streaming {len(self.chans)} ch @ {rate / 1e3:g} kHz"
         self.status.showMessage(msg + (f" · {note}" if note else ""))
 
-    def _reader(self, bps):
-        while not self.stopflag.is_set():
-            data = la.read_frame(self.port, self.leftover, timeout=1.0)
+    def _reader(self, bps, stopflag):
+        # Short read timeout: a stop request must not wait a second for the reader to
+        # notice.  Partial frames stay in self.leftover and resume next call.
+        while not stopflag.is_set():
+            data = la.read_frame(self.port, self.leftover, timeout=0.1)
             if not data:
                 continue
             a = np.frombuffer(la.decode_samples(data, bps), dtype=np.uint32)
@@ -1285,15 +1320,38 @@ class ScopeWindow(QtWidgets.QMainWindow):
             return
         self.stopflag.set()
         if self.thread:
-            self.thread.join(timeout=2)
+            self.thread.join(timeout=0.6)      # reader wakes on its 0.1 s read timeout
         if self.port:
-            la.stream_stop(self.port)
+            try:
+                la.stream_stop(self.port)
+            except Exception:
+                pass
         self.running = False
 
     def _auto_restart(self, *_):
-        """Rate/window/channels define the stream: restart on change (debounced)."""
+        """Rate/channels define the stream: restart on change (debounced)."""
         if self.running:
             self.restart_timer.start()
+
+    def _window_changed(self, *_):
+        """The window is a *display* parameter: apply it live by growing the history
+        ring if needed — never stop/start the stream for a timebase change."""
+        try:
+            ms = float(self.cb_win.currentText())
+        except ValueError:
+            return
+        if not self.running:
+            return
+        # 4M samples = 16 MB for the window; the ring caps at 8M (32 MB).
+        win_samples = min(max(int(ms / 1000.0 * self.rate), 64), 4_000_000)
+        self._grow_ring(2 * win_samples)
+        win_samples = min(win_samples, self.ring_cap // 2)
+        self.win_samples = max(win_samples, 64)
+        self._drawn_total = -1          # force the next tick to redraw
+        self._draw_t = 0.0
+        shown = self.win_samples / self.rate * 1e3 if self.rate else ms
+        self.status.showMessage(
+            f"window {shown:.4g} ms" + ("  (memory limit)" if shown < ms * 0.999 else ""))
 
     def _restart_stream(self):
         if not self.running:
@@ -1320,9 +1378,9 @@ class ScopeWindow(QtWidgets.QMainWindow):
         if not (0 <= i < len(vals)) or vals[i] == cur:
             return
         self.cb_win.setCurrentText(f"{vals[i]:g}")
-        self._auto_restart()
-        self.status.showMessage(
-            f"window {vals[i]:g} ms" + (" — reconfiguring…" if self.running else ""))
+        self._window_changed()
+        if not self.running:
+            self.status.showMessage(f"window {vals[i]:g} ms")
 
     def stop(self):
         self.auto_single = False
@@ -1759,15 +1817,14 @@ class ScopeWindow(QtWidgets.QMainWindow):
         if i > 0 and abs(x[i - 1] - self._hover_ms) <= abs(x[i] - self._hover_ms):
             i -= 1
         ms = float(x[i])
-        # which row is under the pointer?
+        # which row is under the pointer? (nearest row — the gaps between rows are
+        # wider than the rows; dropping the channel there made the GP label vanish)
         n = len(self.chans)
         step = 2.0
         k = None
         if n:
             k = int(round(((n - 1) * step + 0.4 - self._hover_y) / step))
             k = max(0, min(n - 1, k))
-            if abs(((n - 1 - k) * step + 0.4) - self._hover_y) > 0.95:
-                k = None
         txt = f'<span style="color:#8b949e">t</span> {self._fmt_t(ms)}'
         edge_i = None
         if k is not None:

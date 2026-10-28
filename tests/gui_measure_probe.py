@@ -55,6 +55,13 @@ t3 = label()
 print("hover2:", t3)
 assert "GP17" in t3, t3
 
+# --- hovering in the gap between rows still names the nearest channel
+win._hover_ms, win._hover_y = 0.151, 1.4
+win._hover_update()
+t3b = label()
+print("gap    :", t3b)
+assert "GP16" in t3b or "GP17" in t3b, t3b
+
 # --- a view with no edges nearby must not claim a period
 win._hover_ms = 5.0        # outside the array: clamps to the last sample
 win._hover_update()

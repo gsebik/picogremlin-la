@@ -73,9 +73,10 @@ la gui                                 # Qt GUI (needs the [gui] extra)
 - **Wheel** over the plot steps the capture-window presets — the scope timebase
   (wheel up = zoom in). View zoom is deliberately *not* on the wheel: rescaling
   an already-captured trace hides the fact that the window is the timebase.
-- Changing **rate**, **window** or the **selected channels** while streaming
-  restarts the stream automatically (debounced ~300 ms), so the new settings
-  apply without a manual Stop/Run round trip.
+- **Window** changes apply instantly: the history ring grows in place, so wheel
+  zoom (and typing a window) never stops the stream. **Rate** and **channels**
+  reconfigure the probe, so those restart the stream automatically (300 ms
+  debounce) — no manual Stop/Run round trip.
 
 The probe is picked via `PICOGREMLIN_SERIAL` (else the only one attached).
 Channel *k* is GPIO (2+k): GP16/GP17 are channels 14/15, channels 21-23 are

@@ -3,6 +3,7 @@ os.environ["QT_QPA_PLATFORM"] = "offscreen"
 sys.path.insert(0, "src")
 
 from PyQt6 import QtWidgets, QtCore
+import numpy as np
 from PyQt6.QtTest import QTest
 from picogremlin_la.gui import ScopeWindow
 
@@ -39,6 +40,24 @@ win._auto_restart()
 QTest.qWait(450)
 print("restart    :", calls)
 assert calls == ["stop", "start"], calls
+
+# --- window growth is live: the ring grows, nothing restarts
+win.rate = 100_000
+win.ring = np.zeros(2048, dtype=np.uint32)
+win.ring_cap, win.ring_total, win.ring_pos = 2048, 0, 0
+win.running = True
+calls.clear()
+win.cb_win.setCurrentText("100")          # 100 ms @ 100k = 10k samples -> need 20k
+win._window_changed()
+print("grow ring  :", win.ring_cap, "win_samples:", win.win_samples, "restarts:", calls)
+assert win.ring_cap >= 20000, win.ring_cap
+assert win.win_samples == 10000, win.win_samples
+assert calls == [], calls
+# shrink stays live too
+win.cb_win.setCurrentText("5")
+win._window_changed()
+print("shrink ring:", win.ring_cap, "win_samples:", win.win_samples, "restarts:", calls)
+assert win.win_samples == 500 and calls == []
 
 # --- and nothing restarts while stopped
 calls.clear()
