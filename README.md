@@ -59,6 +59,18 @@ la stream -c 14,15 -r 200k --seconds 1 -o rec   # gapless -> rec.csv/.vcd
 la gui                                 # Qt GUI (needs the [gui] extra)
 ```
 
+## Measuring in the GUI
+
+- **Hover** the plot: a dashed line follows the pointer and the bar under the plot
+  shows the time, the channel under the mouse (GP name + level), the time since its
+  last edge, the **width** of the level, and the **period** (same-direction edges)
+  with the frequency. Close to an edge the line snaps to it and turns into a
+  dotted edge marker — the cursor gives you the edge-to-edge numbers directly.
+- **Cursors** (⊢⊣ button): drag the A/B lines, or **Shift-click** = A,
+  **Ctrl-click** = B. The bar shows A→B, Δt and 1/Δt (e.g. `Δ 200 µs · 5 kHz`);
+  the shaded band marks the measured interval. The lines stay put while the
+  stream updates, so you can park them on two edges.
+
 The probe is picked via `PICOGREMLIN_SERIAL` (else the only one attached).
 Channel *k* is GPIO (2+k): GP16/GP17 are channels 14/15, channels 21-23 are
 GP26-28.
@@ -78,6 +90,7 @@ The protocol is documented in the firmware repository (`docs/LA_PROTOCOL.md`).
 ```bash
 PYTHONPATH=src python3 -m unittest discover -s tests -v   # unit tests, no hardware
 QT_QPA_PLATFORM=offscreen la gui --smoke                  # GUI smoke (no probe needed)
+QT_QPA_PLATFORM=offscreen python tests/gui_measure_probe.py   # cursor/hover math, no probe
 ```
 
 ## License

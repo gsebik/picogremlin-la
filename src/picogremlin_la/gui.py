@@ -339,6 +339,29 @@ class ScopeWindow(QtWidgets.QMainWindow):
         self.frames = 0
         self.aligned = False
 
+        # Redraw/measurement state.  The UI thread must never do unbounded work per
+        # timer tick — that is what shows up as "(Not Responding)": a long window at a
+        # high rate used to rebuild every plot item and re-scan the whole ring 12x/s.
+        self._drawn_total = -1
+        self._draw_t = 0.0
+        self._det_fed = 0
+        self._curve_key = None
+        self._curve_items = []
+        self._view_bits = []
+        self._view_serial = 0
+        self._hover_on = False
+        self._hover_ms = None
+        self._hover_y = 0.0
+        self._hover_k = -1
+        self._hover_t = 0.0
+        self._hover_edges = None
+        self._hover_bit = 0
+        self._hover_text = ""
+        self.win_samples = 0
+        self.ring_cap = 0
+        self.ring_pos = 0
+        self.ring_total = 0
+
         # connect once here: connecting per one_shot() call would stack
         # duplicate connections and fire _show_oneshot N times per capture
         self.oneshot_done.connect(self._show_oneshot)
@@ -471,6 +494,14 @@ class ScopeWindow(QtWidgets.QMainWindow):
             "a warning instead, and set the rate yourself.")
         self.fit_btn.toggled.connect(lambda _=None: self._style_buttons())
         tb.addWidget(self.fit_btn)
+        self.cursors_btn = QtWidgets.QToolButton()
+        self.cursors_btn.setText("⊢⊣  Cursors")
+        self.cursors_btn.setCheckable(True)
+        self.cursors_btn.setToolTip(
+            "Time cursors A and B: drag them, or Shift-click / Ctrl-click the plot.\n"
+            "The bar under the plot shows A→B (Δt and 1/Δt).")
+        self.cursors_btn.toggled.connect(self._cursors_toggled)
+        tb.addWidget(self.cursors_btn)
         self.maxpost_lbl = QtWidgets.QLabel("")
         self.maxpost_lbl.setStyleSheet("color:#8b949e; padding-left:4px;")
         self.maxpost_lbl.setToolTip(
@@ -558,20 +589,60 @@ class ScopeWindow(QtWidgets.QMainWindow):
         sv.addWidget(self.tabs, 1)
         side.setFixedWidth(340)
 
-        # plot
+        # plot — the measurement overlays (cursors, hover) are created once and never
+        # cleared; _draw() updates the curve items in place instead of rebuilding them.
         self.plot = pg.PlotWidget()
         self.plot.showGrid(x=True, y=False, alpha=0.15)
         self.plot.setLabel("bottom", "time (ms)")
         self.plot.getAxis("left").setWidth(150)
         self.annot = pg.TextItem(anchor=(0, 0))
+        self.annot.setZValue(20)
         self.plot.addItem(self.annot)
         self.curves = []
+
+        self.cur_a = pg.InfiniteLine(angle=90, movable=True, label="A",
+                                     pen=pg.mkPen("#58a6ff", width=1.4),
+                                     labelOpts={"position": 0.94, "color": "#58a6ff"})
+        self.cur_b = pg.InfiniteLine(angle=90, movable=True, label="B",
+                                     pen=pg.mkPen("#f0883e", width=1.4),
+                                     labelOpts={"position": 0.90, "color": "#f0883e"})
+        self.cur_region = pg.LinearRegionItem(brush=pg.mkBrush(88, 166, 255, 26),
+                                              pen=pg.mkPen(None), movable=False)
+        self.hover_line = pg.InfiniteLine(
+            angle=90, movable=False,
+            pen=pg.mkPen("#8b949e", width=1, style=QtCore.Qt.PenStyle.DashLine))
+        self.edge_line = pg.InfiniteLine(
+            angle=90, movable=False,
+            pen=pg.mkPen("#7ee787", width=1, style=QtCore.Qt.PenStyle.DotLine))
+        for it in (self.cur_region, self.cur_a, self.cur_b, self.edge_line,
+                   self.hover_line):
+            it.setZValue(40)
+            it.setVisible(False)
+            self.plot.addItem(it)
+        self.cur_a.sigPositionChanged.connect(self._cursors_changed)
+        self.cur_b.sigPositionChanged.connect(self._cursors_changed)
+        self.plot.scene().sigMouseMoved.connect(self._hover_moved)
+        self.plot.scene().sigMouseClicked.connect(self._plot_clicked)
 
         central = QtWidgets.QWidget()
         h = QtWidgets.QHBoxLayout(central)
         h.setContentsMargins(0, 0, 0, 0)
         h.addWidget(side)
-        h.addWidget(self.plot, 1)
+        right = QtWidgets.QWidget()
+        rv = QtWidgets.QVBoxLayout(right)
+        rv.setContentsMargins(0, 0, 0, 0)
+        rv.setSpacing(0)
+        rv.addWidget(self.plot, 1)
+        self.meas_lbl = QtWidgets.QLabel()
+        self.meas_lbl.setTextFormat(QtCore.Qt.TextFormat.RichText)
+        self.meas_lbl.setStyleSheet("color:#8b949e; padding:3px 6px;")
+        mf = self.meas_lbl.font()
+        mf.setFamily("monospace")
+        mf.setPointSizeF(8.5)
+        self.meas_lbl.setFont(mf)
+        self.meas_lbl.setMinimumWidth(600)
+        rv.addWidget(self.meas_lbl)
+        h.addWidget(right, 1)
         self.setCentralWidget(central)
 
         self.status = self.statusBar()
@@ -688,6 +759,7 @@ class ScopeWindow(QtWidgets.QMainWindow):
     def _arm_detector(self):
         self.detector = EventDetector()
         self.detector.arm(self.ring_total)
+        self._det_fed = self.ring_total      # only samples after arming are fed
         self.held_view = None          # back to live until the next trigger
         self.annot_text = ''
 
@@ -710,13 +782,19 @@ class ScopeWindow(QtWidgets.QMainWindow):
         trig = self.trig_channel()
         if self.detector is None or trig is None:
             return False
-        rate = self.rate
-        gap_s = max(self.sb_post.value() / 1000.0, 0.05)
-        seen = self._ring_slice(max(0, n - self.ring_cap), n)
+        # Only NEW samples: feeding the detector the whole ring on every tick made a
+        # long window's tick O(ring) and left the window unresponsive.
+        start = max(self._det_fed, n - self.ring_cap, 0)
+        if start >= n:
+            return False
+        seen = self._ring_slice(start, n)
+        self._det_fed = n
         if seen is None or not len(seen):
             return False
+        rate = self.rate
+        gap_s = max(self.sb_post.value() / 1000.0, 0.05)
         bits = ((seen >> trig) & 1).astype(np.int8)
-        ev = self.detector.feed(n - len(seen), bits, n, rate, gap_s)
+        ev = self.detector.feed(start, bits, n, rate, gap_s)
         if ev is None:
             return False
         first, last = ev
@@ -1116,6 +1194,11 @@ class ScopeWindow(QtWidgets.QMainWindow):
         self.ring = np.zeros(self.ring_cap, dtype=np.uint32)
         self.ring_pos = 0
         self.ring_total = 0
+        self._det_fed = 0
+        self._drawn_total = -1
+        self._draw_t = 0.0
+        self.metrics = {}
+        self._view_bits = []
         self.leftover = leftover
         self.running = True
         self.n = self.frames = 0
@@ -1319,6 +1402,21 @@ class ScopeWindow(QtWidgets.QMainWindow):
         have = min(total, self.ring_cap)
         if not have:
             return
+        now = time.monotonic()
+        if self.rate_t and now - self.rate_t > 1.0:
+            self.rate_meas = (n - self.rate_n) / (now - self.rate_t)
+            self.rate_t, self.rate_n = now, n
+        elif not self.rate_t:
+            self.rate_t, self.rate_n = now, n
+        # The detector only ever sees NEW samples. Feeding it the whole ring every
+        # tick was O(ring) per tick and starved the UI thread on long windows.
+        self._feed_detector(n)
+        # Replot at most ~7x/s, and only when samples arrived. Rebuilding every
+        # item 12.5x/s is what produced the "(Not Responding)" freeze.
+        if total == self._drawn_total or now - self._draw_t < 0.14:
+            return
+        self._draw_t = now
+        self._drawn_total = total
         w = min(self.win_samples, have)
         span = min(have, 2 * w)              # window + margin for trigger alignment
         start = (pos - span) % self.ring_cap
@@ -1327,7 +1425,6 @@ class ScopeWindow(QtWidgets.QMainWindow):
         else:
             samples = np.concatenate((self.ring[start:],
                                       self.ring[:(start + span) % self.ring_cap]))
-        self._feed_detector(n)
 
         trig = self.trig_channel()
         lead = w // 2
@@ -1381,12 +1478,6 @@ class ScopeWindow(QtWidgets.QMainWindow):
             self.metrics = la.quick_metrics(mv, self.rate / mstride,
                                             self.chans, self.chans, np)
         self._draw(view=view, x=x, bits=self.chans)
-        now = time.monotonic()
-        if self.rate_t and now - self.rate_t > 1.0:
-            self.rate_meas = (n - self.rate_n) / (now - self.rate_t)
-            self.rate_t, self.rate_n = now, n
-        elif not self.rate_t:
-            self.rate_t, self.rate_n = now, n
         self._set_state("running", f"{self.rate_meas / 1e3:.0f} kHz")
         if self.detector is not None:
             if self.detector.active:
@@ -1403,39 +1494,42 @@ class ScopeWindow(QtWidgets.QMainWindow):
             f"{n} samples · {disp}")
 
     def _draw(self, view, x, bits):
-        self.plot.clear()
-        self.plot.addItem(self.annot)              # clear() removes it too
-        self.curves = []
         n = len(self.chans)
         step = 2.0
         arr = np.asarray(view, dtype=np.uint32)
-        stride = max(1, len(arr) // 8000)          # keep redraws smooth
+        key = tuple(self.chans)
+        if key != self._curve_key or len(self._curve_items) != n:
+            self._build_curves(n, key)
+        # The screen shows ~8k points per row at most; decimate the *display* input
+        # first so a 24-channel multi-second window stays responsive. The hover
+        # measurements below keep the full-rate arrays.
+        arr_plot, x_plot = arr, x
+        if len(arr) > 400_000:
+            d = -(-len(arr) // 400_000)          # ceil
+            arr_plot, x_plot = arr[::d], x[::d]
+        stride = max(1, len(arr_plot) // 8000)     # keep redraws smooth
         ax = self.plot.getAxis("left")
         ticks = []
         for k, ch in enumerate(self.chans):
             off = (n - 1 - k) * step
-            b = (arr >> bits[k]) & 1
-            col = ch_color(ch)
+            b = (arr_plot >> bits[k]) & 1
+            plain, hi_i, lo_i = self._curve_items[k]
             if stride > 1 and len(b) >= stride:
                 # long window: envelope per bucket (any-high fills, all-high line),
                 # so fast signals show as bands instead of aliasing garbage
                 nb = len(b) // stride
                 bb = b[:nb * stride].reshape(nb, stride)
-                xb = x[:nb * stride:stride]
-                hi = bb.any(axis=1).astype(np.float32) * 0.8 + off
-                lo = bb.all(axis=1).astype(np.float32) * 0.8 + off
-                fill = QtGui.QColor(col)
-                fill.setAlpha(55)
-                self.plot.plot(xb, hi, pen=pg.mkPen(col, width=1.2),
-                               stepMode="left", fillLevel=off,
-                               brush=pg.mkBrush(fill))
-                self.plot.plot(xb, lo, pen=pg.mkPen(col, width=1.0, alpha=140),
-                               stepMode="left")
+                xb = x_plot[:nb * stride:stride]
+                hi_i.setData(xb, bb.any(axis=1).astype(np.float32) * 0.8 + off)
+                lo_i.setData(xb, bb.all(axis=1).astype(np.float32) * 0.8 + off)
+                plain.setVisible(False)
+                hi_i.setVisible(True)
+                lo_i.setVisible(True)
             else:
-                y = b.astype(np.float32) * 0.8 + off
-                curve = self.plot.plot(x, y, pen=pg.mkPen(col, width=1.6),
-                                       stepMode="left")
-                self.curves.append(curve)
+                plain.setData(x_plot, b.astype(np.float32) * 0.8 + off)
+                plain.setVisible(True)
+                hi_i.setVisible(False)
+                lo_i.setVisible(False)
             m = self.metrics.get(ch)
             lab = f"GP{la.chan_pin(ch)}"
             if m:
@@ -1449,8 +1543,216 @@ class ScopeWindow(QtWidgets.QMainWindow):
             self.annot.setPos(float(x[0]), (n - 1) * step + 1.15)
         else:
             self.annot.setHtml("")
+        # what the hover readout needs (full rate; only ONE channel per mouse move)
+        self._view_x = x
+        self._arr = arr
+        self._view_bits = list(bits)
+        self._view_serial += 1
         if self.view is not None:
             self._update_table()
+        if self._hover_on:
+            self._hover_update()
+
+    def _build_curves(self, n, key):
+        """Create the per-row plot items once; _draw() then only setData()s them."""
+        for items in self._curve_items:
+            for it in items:
+                self.plot.removeItem(it)
+        self._curve_items = []
+        step = 2.0
+        for k, ch in enumerate(self.chans):
+            off = (n - 1 - k) * step
+            col = ch_color(ch)
+            fill = QtGui.QColor(col)
+            fill.setAlpha(55)
+            plain = self.plot.plot([], [], pen=pg.mkPen(col, width=1.6), stepMode="left")
+            hi = self.plot.plot([], [], pen=pg.mkPen(col, width=1.2), stepMode="left",
+                                fillLevel=off, brush=pg.mkBrush(fill))
+            lo = self.plot.plot([], [], pen=pg.mkPen(col, width=1.0, alpha=140),
+                                stepMode="left")
+            for it in (plain, hi, lo):
+                it.setVisible(False)
+            self._curve_items.append((plain, hi, lo))
+        self._curve_key = key
+
+    # ------------------------------------------- measurements (cursors / edge hover)
+    def _fmt_t(self, ms):
+        a = abs(ms)
+        if a < 1e-3:
+            return f"{ms * 1e6:.0f} ns"
+        if a < 1.0:
+            return f"{ms * 1e3:.4g} µs"
+        return f"{ms:.5g} ms"
+
+    def _fmt_hz(self, hz):
+        a = abs(hz)
+        if a >= 1e6:
+            return f"{hz / 1e6:.4g} MHz"
+        if a >= 1e3:
+            return f"{hz / 1e3:.4g} kHz"
+        return f"{hz:.4g} Hz"
+
+    def _cursors_toggled(self, on):
+        self.cur_a.setVisible(on)
+        self.cur_b.setVisible(on)
+        self.cur_region.setVisible(on)
+        if on:
+            x0, x1 = self.plot.viewRange()[0]
+            a, b = self.cur_a.value(), self.cur_b.value()
+            if x1 > x0 and (a == b or not (x0 <= a <= x1) or not (x0 <= b <= x1)):
+                self.cur_a.setValue(x0 + (x1 - x0) * 0.30)
+                self.cur_b.setValue(x0 + (x1 - x0) * 0.70)
+            self._cursors_changed()
+            self.status.showMessage(
+                "cursors on — drag A/B, or Shift-click / Ctrl-click the plot")
+        else:
+            self.status.showMessage("cursors off")
+            self._refresh_meas()
+
+    def _cursors_changed(self, *_):
+        a, b = self.cur_a.value(), self.cur_b.value()
+        lo, hi = (a, b) if a <= b else (b, a)
+        self.cur_region.setRegion((lo, hi))
+        self._refresh_meas()
+
+    def _plot_clicked(self, ev):
+        if ev.button() != QtCore.Qt.MouseButton.LeftButton:
+            return
+        vb = self.plot.getViewBox()
+        if not vb.sceneBoundingRect().contains(ev.scenePos()):
+            return
+        mods = ev.modifiers()
+        set_a = bool(mods & QtCore.Qt.KeyboardModifier.ShiftModifier)
+        set_b = bool(mods & QtCore.Qt.KeyboardModifier.ControlModifier)
+        if not (set_a or set_b):
+            return
+        if not self.cursors_btn.isChecked():
+            self.cursors_btn.setChecked(True)
+        ms = vb.mapSceneToView(ev.scenePos()).x()
+        if set_a:
+            self.cur_a.setValue(ms)
+        if set_b:
+            self.cur_b.setValue(ms)
+        self._cursors_changed()
+
+    def _refresh_meas(self):
+        parts = []
+        if self.cursors_btn.isChecked():
+            a, b = self.cur_a.value(), self.cur_b.value()
+            dt = b - a
+            s = (f'<span style="color:#58a6ff">A</span> {self._fmt_t(a)}'
+                 f' · <span style="color:#f0883e">B</span> {self._fmt_t(b)}'
+                 f' · <b>Δ {self._fmt_t(dt)}</b>')
+            if abs(dt) > 1e-9:
+                s += f' · {self._fmt_hz(1000.0 / dt)}'
+            parts.append(s)
+        if self._hover_text:
+            parts.append(self._hover_text)
+        if not parts:
+            parts.append('<span style="color:#8b949e">cursors off — Shift-click = A, '
+                         'Ctrl-click = B · hover the plot for edge timings</span>')
+        self.meas_lbl.setText("   ".join(parts))
+
+    def _hover_moved(self, scene_pos):
+        if self.view is None or len(self.view) < 2:
+            return
+        vb = self.plot.getViewBox()
+        if not vb.sceneBoundingRect().contains(scene_pos):
+            self._hover_off()
+            return
+        p = vb.mapSceneToView(scene_pos)
+        self._hover_on = True
+        self._hover_ms = p.x()
+        self._hover_y = p.y()
+        now = time.monotonic()
+        if now - self._hover_t < 0.033:      # ~30 Hz is plenty
+            return
+        self._hover_t = now
+        self._hover_update()
+
+    def _hover_off(self):
+        if not self._hover_on and not self._hover_text:
+            return
+        self._hover_on = False
+        self._hover_text = ""
+        self.hover_line.setVisible(False)
+        self.edge_line.setVisible(False)
+        self._refresh_meas()
+
+    def _hover_update(self):
+        if not (self._hover_on and self.view is not None):
+            return
+        x = getattr(self, "_view_x", None)
+        arr = getattr(self, "_arr", None)
+        if x is None or arr is None or not len(x):
+            return
+        i = int(np.searchsorted(x, self._hover_ms))
+        i = max(0, min(i, len(x) - 1))
+        if i > 0 and abs(x[i - 1] - self._hover_ms) <= abs(x[i] - self._hover_ms):
+            i -= 1
+        ms = float(x[i])
+        # which row is under the pointer?
+        n = len(self.chans)
+        step = 2.0
+        k = None
+        if n:
+            k = int(round(((n - 1) * step + 0.4 - self._hover_y) / step))
+            k = max(0, min(n - 1, k))
+            if abs(((n - 1 - k) * step + 0.4) - self._hover_y) > 0.95:
+                k = None
+        txt = f'<span style="color:#8b949e">t</span> {self._fmt_t(ms)}'
+        edge_i = None
+        if k is not None:
+            ch = self.chans[k]
+            bit = self._view_bits[k] if k < len(self._view_bits) else ch
+            col = ch_color(ch)
+            # Local slice around the pointer: cheap even in a multi-second view.
+            half = max(2048, min(len(arr), 200_000) // 2)
+            lo = max(0, i - half)
+            hi = min(len(arr), i + half + 1)
+            seg = ((arr[lo:hi] >> bit) & 1)
+            edges = np.nonzero(np.diff(seg))[0] + lo + 1
+            lvl = "high" if seg[i - lo] else "low"
+            txt += f' · <span style="color:{col}">GP{la.chan_pin(ch)} {lvl}</span>'
+            if len(edges):
+                j = int(np.searchsorted(edges, i))
+                prev_i = int(edges[j - 1]) if j >= 1 else None
+                next_i = int(edges[j]) if j < len(edges) else None
+                near = [e for e in (prev_i, next_i) if e is not None]
+                if near:
+                    e = min(near, key=lambda q: abs(int(q) - i))
+                    if abs(float(x[e]) - ms) <= 0.02 * max(1e-9, float(x[-1] - x[0])):
+                        edge_i = int(e)
+                if prev_i is None and next_i is not None:
+                    txt += f' · next edge in {self._fmt_t(float(x[next_i]) - ms)}'
+                if prev_i is not None:
+                    txt += f' · last edge {self._fmt_t(ms - float(x[prev_i]))} ago'
+                if prev_i is not None and next_i is not None:
+                    # width of the level under the pointer: adjacent edges
+                    txt += f' · width {self._fmt_t(float(x[next_i] - x[prev_i]))}'
+                # Period = two SAME-DIRECTION edges. Adjacent edges alternate
+                # direction, so using them would report only half the period.
+                per = None
+                if j >= 3 and prev_i is not None:
+                    per = float(x[prev_i] - x[int(edges[j - 3])])
+                elif prev_i is not None and j + 1 < len(edges):
+                    per = float(x[int(edges[j + 1])] - x[prev_i])
+                elif prev_i is None and len(edges) >= 3:
+                    per = float(x[int(edges[2])] - x[int(edges[0])])
+                if per and per > 0:
+                    txt += f' · period {self._fmt_t(per)} ({self._fmt_hz(1000.0 / per)})'
+        if edge_i is not None:
+            self.edge_line.setVisible(True)
+            self.edge_line.setValue(float(x[edge_i]))
+            self.edge_line.setPen(pg.mkPen(ch_color(self.chans[k]), width=1,
+                                           style=QtCore.Qt.PenStyle.DotLine))
+            self.hover_line.setValue(float(x[edge_i]))
+        else:
+            self.edge_line.setVisible(False)
+            self.hover_line.setValue(ms)
+        self.hover_line.setVisible(True)
+        self._hover_text = txt
+        self._refresh_meas()
 
     def _update_table(self):
         self.table.setRowCount(len(self.chans))
