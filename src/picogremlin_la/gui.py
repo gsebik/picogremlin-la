@@ -295,6 +295,27 @@ class PinPicker(QtWidgets.QWidget):
 
 
 # ------------------------------------------------------------------- window
+class ScopePlot(pg.PlotWidget):
+    """PlotWidget whose wheel changes the CAPTURE window — the scope timebase.
+
+    pyqtgraph's default wheel zoom only rescales an already captured trace, which is
+    meaningless for a live scope: the window setting *is* the timebase.  Wheel up =
+    zoom in (shorter window).
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.wheel_cb = None
+
+    def wheelEvent(self, ev):
+        dy = ev.angleDelta().y()
+        if self.wheel_cb is not None and dy:
+            self.wheel_cb(dy)
+            ev.accept()
+            return
+        super().wheelEvent(ev)
+
+
 class ScopeWindow(QtWidgets.QMainWindow):
     oneshot_done = QtCore.pyqtSignal(object)
 
@@ -361,6 +382,13 @@ class ScopeWindow(QtWidgets.QMainWindow):
         self.ring_cap = 0
         self.ring_pos = 0
         self.ring_total = 0
+
+        # Changing rate/window/channels reconfigures the probe: debounce and restart
+        # automatically instead of making the user press Stop then Run.
+        self.restart_timer = QtCore.QTimer(self)
+        self.restart_timer.setSingleShot(True)
+        self.restart_timer.setInterval(300)
+        self.restart_timer.timeout.connect(self._restart_stream)
 
         # connect once here: connecting per one_shot() call would stack
         # duplicate connections and fire _show_oneshot N times per capture
@@ -431,6 +459,8 @@ class ScopeWindow(QtWidgets.QMainWindow):
         self.cb_rate.setCurrentText("1M")
         self.cb_rate.setFixedWidth(80)
         self.cb_rate.currentTextChanged.connect(lambda _=None: self._update_maxpost())
+        self.cb_rate.activated.connect(self._auto_restart)
+        self.cb_rate.lineEdit().editingFinished.connect(self._auto_restart)
         tb.addWidget(self.cb_rate)
 
         tb.addWidget(QtWidgets.QLabel("  window ms "))
@@ -439,6 +469,8 @@ class ScopeWindow(QtWidgets.QMainWindow):
         self.cb_win.addItems(["0.5", "1", "2", "5", "10", "20", "50", "100", "200",
                               "500", "1000", "2000", "5000"])
         self.cb_win.setFixedWidth(70)
+        self.cb_win.activated.connect(self._auto_restart)
+        self.cb_win.lineEdit().editingFinished.connect(self._auto_restart)
         tb.addWidget(self.cb_win)
 
         tb.addWidget(QtWidgets.QLabel("  trigger "))
@@ -591,7 +623,8 @@ class ScopeWindow(QtWidgets.QMainWindow):
 
         # plot — the measurement overlays (cursors, hover) are created once and never
         # cleared; _draw() updates the curve items in place instead of rebuilding them.
-        self.plot = pg.PlotWidget()
+        self.plot = ScopePlot()
+        self.plot.wheel_cb = self._wheel_window
         self.plot.showGrid(x=True, y=False, alpha=0.15)
         self.plot.setLabel("bottom", "time (ms)")
         self.plot.getAxis("left").setWidth(150)
@@ -1136,6 +1169,7 @@ class ScopeWindow(QtWidgets.QMainWindow):
             self.pins.set_selection([16, 17])
             self.chans = self.pins.channels()
         self._trigger_picked()
+        self._auto_restart()          # channels define the stream mode
 
     def _pin_trigger(self, gp):
         for i in range(self.cb_trig.count()):
@@ -1255,6 +1289,40 @@ class ScopeWindow(QtWidgets.QMainWindow):
         if self.port:
             la.stream_stop(self.port)
         self.running = False
+
+    def _auto_restart(self, *_):
+        """Rate/window/channels define the stream: restart on change (debounced)."""
+        if self.running:
+            self.restart_timer.start()
+
+    def _restart_stream(self):
+        if not self.running:
+            return
+        self.stop_quiet()
+        self.start()
+
+    def _wheel_window(self, dy):
+        """Wheel = timebase: step through the window presets (up = zoom in)."""
+        vals = []
+        for i in range(self.cb_win.count()):
+            try:
+                vals.append(float(self.cb_win.itemText(i)))
+            except ValueError:
+                pass
+        try:
+            cur = float(self.cb_win.currentText())
+        except ValueError:
+            return
+        if cur not in vals:
+            vals.append(cur)
+            vals.sort()
+        i = vals.index(cur) + (-1 if dy > 0 else 1)
+        if not (0 <= i < len(vals)) or vals[i] == cur:
+            return
+        self.cb_win.setCurrentText(f"{vals[i]:g}")
+        self._auto_restart()
+        self.status.showMessage(
+            f"window {vals[i]:g} ms" + (" — reconfiguring…" if self.running else ""))
 
     def stop(self):
         self.auto_single = False

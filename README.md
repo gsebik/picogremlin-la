@@ -70,6 +70,12 @@ la gui                                 # Qt GUI (needs the [gui] extra)
   **Ctrl-click** = B. The bar shows A→B, Δt and 1/Δt (e.g. `Δ 200 µs · 5 kHz`);
   the shaded band marks the measured interval. The lines stay put while the
   stream updates, so you can park them on two edges.
+- **Wheel** over the plot steps the capture-window presets — the scope timebase
+  (wheel up = zoom in). View zoom is deliberately *not* on the wheel: rescaling
+  an already-captured trace hides the fact that the window is the timebase.
+- Changing **rate**, **window** or the **selected channels** while streaming
+  restarts the stream automatically (debounced ~300 ms), so the new settings
+  apply without a manual Stop/Run round trip.
 
 The probe is picked via `PICOGREMLIN_SERIAL` (else the only one attached).
 Channel *k* is GPIO (2+k): GP16/GP17 are channels 14/15, channels 21-23 are
