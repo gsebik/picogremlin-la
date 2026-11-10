@@ -87,6 +87,26 @@ The probe is picked via `PICOGREMLIN_SERIAL` (else the only one attached).
 Channel *k* is GPIO (2+k): GP16/GP17 are channels 14/15, channels 21-23 are
 GP26-28.
 
+### Analog tab
+
+The **analog** tab turns the same window into an ADC scope:
+
+- tick **A0/GP26**, **A1/GP27**, **A2/GP28** and/or **temp**; pick the
+  per-channel **rate** (10k…500k) and **samples/ch**;
+- **⚡ Single** takes one capture (immediately, or armed with the **trigger**
+  level you enter — `1.65V`, `1650mV`; **falling** flips the edge);
+- **▶ Stream** runs the gapless stream; the view keeps the last ~20 s and the
+  status bar shows the achieved rate. **8-bit** doubles the stream headroom;
+- the table lists mean, min, max, pp and rms in volts (temperature in °C) plus
+  the crossing frequency/duty, and the plot auto-scales;
+- type an expectation in **check mean** / **freq** (`1.65V±5%`, `1kHz±2%`) and
+  press **Check** — it turns green/red with the measured value; **CSV** writes
+  the samples, **Save…** writes the plot as PNG.
+
+The analog and digital views share the probe's LA port, so starting one stream
+stops the other. Session values (probe selection, window, colours) are
+remembered between runs.
+
 ## Analog inputs
 
 Firmware 1.0+ exposes the RP2350 ADC: **A0/A1/A2 = GP26/GP27/GP28** (the same

@@ -2118,13 +2118,22 @@ def main(argv=None):
             win.tabs.setCurrentWidget(at)
             grab("analog")
 
+            def after_analog_stream():
+                at.btn_stream.setChecked(False)
+                per = len(at._stream_vals) // max(1, len(getattr(at, "_stream_chans", [1])))
+                print(f"smoke6: analog stream frames={at.frames} samples/ch={per} "
+                      f"status='{win.status.currentMessage()}'", flush=True)
+                grab("analog_stream")
+                result["ok"] = True
+                app.quit()
+
             def after_analog():
                 print(f"smoke5: analog live capture rows={at.table.rowCount()} "
                       f"A0 mean={at.table.item(0, 1).text() if at.table.rowCount() else '-'} "
                       f"status='{win.status.currentMessage()}'", flush=True)
                 grab("analog_live")
-                result["ok"] = True
-                app.quit()
+                at.btn_stream.setChecked(True)          # exercise the analog stream
+                QtCore.QTimer.singleShot(1500, after_analog_stream)
 
             def phase_analog():
                 if win.port is None:

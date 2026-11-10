@@ -527,6 +527,18 @@ def analog_supported(caps):
         return None
 
 
+def drain_quiet(port, quiet=0.15, max_time=2.0):
+    """Read and discard until the port has been silent for `quiet` seconds.
+
+    A stopped stream can leave hundreds of kB of binary frames in the buffers;
+    a fixed drain is not enough and those bytes would desync the next reply.
+    """
+    deadline = time.monotonic() + max_time
+    while time.monotonic() < deadline:
+        if not port.read(65536, timeout=quiet):
+            return
+
+
 def la_analog_capture(port, channels, rate, pre, post, eight_bit=False,
                       trigger=None, level=0, inverted=False,
                       head_timeout=10.0, data_timeout=30.0, drain=0.3):
@@ -544,19 +556,31 @@ def la_analog_capture(port, channels, rate, pre, post, eight_bit=False,
                                    trigger if trigger is not None else 0,
                                    1 if inverted else 0, level,
                                    channels, rate, pre, post, 0, 0, mode)
-    port.drain(drain)
+    if drain:
+        drain_quiet(port, quiet=min(0.2, drain), max_time=2.0)
     port.write(la_frame(0x49, req))
     port.flush()
 
     # the firmware sends the header line only when the capture is complete, so
-    # `head_timeout` bounds the whole trigger wait; read the line, not 4 kB
-    head = port.read_until(b"\n", timeout=head_timeout, maxlen=4096)
+    # `head_timeout` bounds the whole trigger wait. Skip any leftover lines
+    # (e.g. a digital capture that was still finishing) instead of desyncing.
+    deadline = time.monotonic() + head_timeout
+    head = b""
+    while time.monotonic() < deadline:
+        chunk = port.read_until(b"\n", timeout=max(0.1, deadline - time.monotonic()),
+                                maxlen=4096)
+        if not chunk:
+            break
+        head = chunk
+        if b"ANALOG_STARTED" in head or b"ANALOG_ERROR" in head:
+            break
     if b"ANALOG_STARTED" not in head:
         if b"ANALOG_ERROR" in head:
             return {"ok": False, "response": "ANALOG_ERROR"}
         return {"ok": False, "response": head.decode(errors="replace")[:80] or "no response"}
-    line_end = head.index(b"\n") + 1
-    line = head[:line_end].decode(errors="replace").split()
+    line_start = head.index(b"ANALOG_STARTED")
+    line_end = head.index(b"\n", line_start) + 1
+    line = head[line_start:line_end].decode(errors="replace").split()
     reported = int(line[1]) if len(line) > 1 else int(rate)
     rest = bytearray(head[line_end:])
 
@@ -584,7 +608,7 @@ def analog_stream_start(port, channels, rate, half, eight_bit=False):
     req = la_build_capture_request(3, 0, 0, 0, channels, rate, 0, half, 0, 0, mode)
     port.write(la_frame(0x42))
     port.flush()
-    port.drain(0.5)
+    drain_quiet(port, quiet=0.15, max_time=2.0)
     port.write(la_frame(0x4A, req))
     port.flush()
     buf = b""
