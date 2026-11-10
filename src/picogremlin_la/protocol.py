@@ -455,6 +455,159 @@ def quick_metrics(arr, rate, chans, bits, np):
             out[ch] = (rate / period, float(b.mean()) * 100.0)
     return out
 
+
+# ---- analog capture (CMD 0x49 one-shot / 0x4A stream) ------------------------
+# Inputs: 0..2 = ADC0..2 on GP26..GP28 (the same pins as LA digital channels
+# 21..23), 3 = the on-chip temperature sensor. Samples are interleaved:
+# value i belongs to channels[i % len(channels)].
+ADC_VREF = 3.3
+ANALOG_INPUTS = {0: "A0/GP26", 1: "A1/GP27", 2: "A2/GP28", 3: "temp"}
+
+
+def adc_volts(raw):
+    """12-bit ADC count -> volts (assuming the 3.3 V reference)."""
+    return raw * ADC_VREF / 4096.0
+
+
+def adc_temp_c(raw):
+    """12-bit count on the temperature input -> degrees Celsius (RP2350)."""
+    return 27.0 - (adc_volts(raw) - 0.706) / 0.001721
+
+
+def parse_analog_channels(spec):
+    """'0,1,temp' / 'A0,A2' / 'GP26' -> [0, 1, 3] (ADC input numbers)."""
+    out = []
+    for tok in str(spec).replace(" ", "").split(","):
+        if not tok:
+            continue
+        t = tok.lower()
+        if t in ("t", "temp", "temperature", "3", "adc4"):
+            out.append(3)
+        elif t.startswith("a") and t[1:].isdigit():
+            out.append(int(t[1:]))
+        elif t.startswith("gp"):
+            gp = int(t[2:])
+            if gp not in (26, 27, 28):
+                raise SystemExit(f"GP{gp} is not an analog input (GP26/27/28 + temp)")
+            out.append(gp - 26)
+        else:
+            v = int(t)
+            if not 0 <= v <= 3:
+                raise SystemExit(f"analog input {v} out of range (0-2, 3=temp)")
+            out.append(v)
+    out = sorted(set(out))
+    if not out:
+        raise SystemExit("no analog inputs selected")
+    return out
+
+
+def pg_info(port, timeout=1.0):
+    """Query CMD 0x40 and return the capability lines as a dict."""
+    port.drain(0.2)
+    port.write(la_frame(0x40))
+    port.flush()
+    buf = port.read(512, timeout=timeout)
+    caps = {}
+    for line in buf.decode(errors="replace").splitlines():
+        if ":" in line:
+            k, v = line.split(":", 1)
+            caps[k.strip()] = v.strip()
+    return caps
+
+
+def analog_supported(caps):
+    """(channels, max_rate, temp) from a PG_INFO dict, or None."""
+    v = caps.get("ANALOG")
+    if not v:
+        return None
+    parts = [p.strip() for p in v.split(",")]
+    try:
+        return (int(parts[0]), int(parts[1]), bool(int(parts[2])) if len(parts) > 2 else False)
+    except (ValueError, IndexError):
+        return None
+
+
+def la_analog_capture(port, channels, rate, pre, post, eight_bit=False,
+                      trigger=None, level=0, inverted=False,
+                      head_timeout=10.0, data_timeout=30.0, drain=0.3):
+    """CMD 0x49 — one-shot ADC capture.
+
+    channels: ADC inputs (0..2 external, 3 = temperature)
+    rate:     requested per-channel sample rate (total is clamped to 500 kS/s)
+    pre/post: samples per channel before/after the trigger
+    trigger:  ADC input to trigger on, or None to capture immediately
+    level:    12-bit threshold for the trigger
+    Returns {"ok", "rate", "values", "channels", "width"} — interleaved values.
+    """
+    mode = 1 if eight_bit else 2
+    req = la_build_capture_request(3 if trigger is None else 0,
+                                   trigger if trigger is not None else 0,
+                                   1 if inverted else 0, level,
+                                   channels, rate, pre, post, 0, 0, mode)
+    port.drain(drain)
+    port.write(la_frame(0x49, req))
+    port.flush()
+
+    # the firmware sends the header line only when the capture is complete, so
+    # `head_timeout` bounds the whole trigger wait; read the line, not 4 kB
+    head = port.read_until(b"\n", timeout=head_timeout, maxlen=4096)
+    if b"ANALOG_STARTED" not in head:
+        if b"ANALOG_ERROR" in head:
+            return {"ok": False, "response": "ANALOG_ERROR"}
+        return {"ok": False, "response": head.decode(errors="replace")[:80] or "no response"}
+    line_end = head.index(b"\n") + 1
+    line = head[:line_end].decode(errors="replace").split()
+    reported = int(line[1]) if len(line) > 1 else int(rate)
+    rest = bytearray(head[line_end:])
+
+    while len(rest) < 4:
+        rest += port.read(4 - len(rest), timeout=10)
+    if len(rest) < 4:
+        return {"ok": False, "response": "timeout waiting for data"}
+    count = struct.unpack("<I", rest[:4])[0]
+    width = 1 if eight_bit else 2
+    want = 4 + count * width + 1
+    while len(rest) < want:
+        chunk = port.read(want - len(rest), timeout=data_timeout)
+        if not chunk:
+            return {"ok": False, "response": "timeout", "got": len(rest), "want": want}
+        rest += chunk
+    fmt = "<%d%s" % (count, "B" if eight_bit else "H")
+    values = list(struct.unpack(fmt, rest[4:4 + count * width]))
+    return {"ok": True, "rate": reported, "values": values,
+            "channels": list(channels), "width": width}
+
+
+def analog_stream_start(port, channels, rate, half, eight_bit=False):
+    """CMD 0x4A — start the gapless ADC stream. Returns (started, leftover, rate)."""
+    mode = 1 if eight_bit else 2
+    req = la_build_capture_request(3, 0, 0, 0, channels, rate, 0, half, 0, 0, mode)
+    port.write(la_frame(0x42))
+    port.flush()
+    port.drain(0.5)
+    port.write(la_frame(0x4A, req))
+    port.flush()
+    buf = b""
+    t0 = time.time()
+    while (b"ANALOG_STREAM_STARTED" not in buf and b"ANALOG_ERROR" not in buf
+           and time.time() - t0 < 5):
+        buf += port.read(256, timeout=0.5)
+    started = b"ANALOG_STREAM_STARTED" in buf
+    rate_rep = int(rate)
+    if started:
+        line = buf[:buf.index(b"\n")].decode(errors="replace").split()
+        if len(line) > 1:
+            rate_rep = int(line[1])
+        tail = buf[buf.index(b"\n") + 1:]
+    else:
+        tail = buf
+    return started, bytearray(tail), rate_rep
+
+
+def analog_channel_values(values, nch):
+    """Split interleaved values into per-channel lists."""
+    return [values[i::nch] for i in range(nch)]
+
 # ---- channel/pin and rate helpers --------------------------------------------
 
 def chan_pin(c):

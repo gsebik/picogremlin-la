@@ -16,6 +16,7 @@ Protocol helpers come from the `cli` module (single source of truth).
 import argparse
 import csv
 import json
+import math
 import os
 import subprocess
 import sys
@@ -23,6 +24,7 @@ import threading
 import time
 from collections import deque
 
+from picogremlin_la import analog_tab
 from picogremlin_la import cli as la
 
 try:
@@ -621,6 +623,8 @@ class ScopeWindow(QtWidgets.QMainWindow):
         self.summary_lbl.setWordWrap(True)
         cpl.addWidget(self.summary_lbl)
         self.tabs.addTab(cap_tab, "captures")
+        self.analog_tab = analog_tab.AnalogTab(self)
+        self.tabs.addTab(self.analog_tab, "analog")
 
         sv.addWidget(self.tabs, 1)
         side.setFixedWidth(340)
@@ -1233,6 +1237,8 @@ class ScopeWindow(QtWidgets.QMainWindow):
 
     # -------------------------------------------------------------- stream
     def start(self):
+        if getattr(self, "analog_tab", None) and self.analog_tab.streaming:
+            self.analog_tab.btn_stream.setChecked(False)
         if self.port is None:
             self.status.showMessage(self.no_probe or "no probe")
             return
@@ -2093,11 +2099,43 @@ def main(argv=None):
                       flush=True)
             print(f"smoke3 summary: {win.summary_lbl.text()}", flush=True)
             win.tabs.setCurrentIndex(1)
-            win._draw(view=win.view, x=win.view_x,
-                      bits=list(range(len(win.chans)))) if False else None
             grab("results")
-            result["ok"] = True
-            app.quit()
+
+            # phase 4: analog tab — synthetic sine + DC, no probe needed
+            at = win.analog_tab
+            rate, n = 100_000, 4000
+            vals = []
+            for i in range(n):
+                vals += [int(2048 + 800 * math.sin(2 * math.pi * 1000 * i / rate)),
+                         2348]
+            at._render(vals, [0, 1], rate)
+            at.chk_mean.setText("1.65V±5%")
+            at.check()
+            print(f"smoke4: analog rows={at.table.rowCount()} "
+                  f"A0 mean={at.table.item(0, 1).text()} freq={at.table.item(0, 6).text()} "
+                  f"| A1 mean={at.table.item(1, 1).text()} "
+                  f"| check='{at.check_lbl.text()}'", flush=True)
+            win.tabs.setCurrentWidget(at)
+            grab("analog")
+
+            def after_analog():
+                print(f"smoke5: analog live capture rows={at.table.rowCount()} "
+                      f"A0 mean={at.table.item(0, 1).text() if at.table.rowCount() else '-'} "
+                      f"status='{win.status.currentMessage()}'", flush=True)
+                grab("analog_live")
+                result["ok"] = True
+                app.quit()
+
+            def phase_analog():
+                if win.port is None:
+                    print("smoke5: no probe — analog live capture skipped", flush=True)
+                    result["ok"] = True
+                    app.quit()
+                    return
+                at.single()
+                QtCore.QTimer.singleShot(2500, after_analog)
+
+            QtCore.QTimer.singleShot(300, phase_analog)
 
         QtCore.QTimer.singleShot(300, phase_stream)
 

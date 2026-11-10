@@ -153,5 +153,63 @@ class TransportTest(unittest.TestCase):
         self.assertNotIn("BBBB", la)
 
 
+class AnalogHelpersTest(unittest.TestCase):
+    def test_parse_analog_channels(self):
+        self.assertEqual(p.parse_analog_channels("0,1"), [0, 1])
+        self.assertEqual(p.parse_analog_channels("temp"), [3])
+        self.assertEqual(p.parse_analog_channels("A2,GP26"), [0, 2])
+        self.assertEqual(p.parse_analog_channels("GP27,T"), [1, 3])
+        with self.assertRaises(SystemExit):
+            p.parse_analog_channels("GP16")     # not an ADC pin
+        with self.assertRaises(SystemExit):
+            p.parse_analog_channels("7")
+
+    def test_adc_conversions(self):
+        self.assertAlmostEqual(p.adc_volts(2048), 1.65, places=3)
+        self.assertAlmostEqual(p.adc_volts(0), 0.0)
+        # 0.706 V at 27 C, 1.721 mV per degree
+        self.assertAlmostEqual(p.adc_temp_c(int(round(0.706 / 3.3 * 4096))), 27.0, delta=0.2)
+        self.assertAlmostEqual(p.adc_temp_c(int(round((0.706 + 0.010326) / 3.3 * 4096))),
+                               21.0, delta=0.6)
+
+    def test_parse_volts(self):
+        self.assertEqual(cli.parse_volts("1.65V"), 2048)
+        self.assertEqual(cli.parse_volts("1650mV"), 2048)
+        self.assertEqual(cli.parse_volts("0"), 0)
+        self.assertEqual(cli.parse_volts("3.3V"), 4095)    # the rail
+        self.assertEqual(cli.parse_volts("9V"), 4095)      # clamped to the rail
+
+    def test_parse_expect(self):
+        v, tol = cli.parse_expect("1.65V±5%")
+        self.assertAlmostEqual(v, 1.65)
+        self.assertAlmostEqual(tol, 0.0825)
+        v, tol = cli.parse_expect("1kHz±2%")
+        self.assertAlmostEqual(v, 1000.0)
+        self.assertAlmostEqual(tol, 20.0)
+        v, tol = cli.parse_expect("3.2V")
+        self.assertAlmostEqual(v, 3.2)
+        self.assertIsNone(tol)
+        v, tol = cli.parse_expect("35°C±10°C")
+        self.assertAlmostEqual(v, 35.0)
+        self.assertAlmostEqual(tol, 10.0)
+
+    def test_measure_analog_sine(self):
+        import math
+        rate, n = 100_000, 4000
+        vals = [int(2048 + 1000 * math.sin(2 * math.pi * 1000 * i / rate))
+                for i in range(n)]
+        m = cli.measure_analog(vals, rate)
+        self.assertAlmostEqual(m["mean"], 2048, delta=25)
+        self.assertAlmostEqual(m["freq"], 1000.0, delta=15.0)
+        self.assertAlmostEqual(m["duty"], 50.0, delta=3.0)
+        self.assertGreater(m["pp"], 1900)
+
+    def test_measure_analog_dc(self):
+        m = cli.measure_analog([2000] * 500, 1000)
+        self.assertEqual(m["freq"], 0.0)
+        self.assertAlmostEqual(m["mean"], 2000.0)
+        self.assertAlmostEqual(m["pp"], 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()
