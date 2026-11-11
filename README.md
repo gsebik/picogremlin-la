@@ -113,10 +113,12 @@ Firmware 1.0+ exposes the RP2350 ADC: **A0/A1/A2 = GP26/GP27/GP28** (the same
 pins as digital channels 21..23) plus the **on-chip temperature** sensor as
 input `3`/`temp`. They are 0–3.3 V only (not 5 V tolerant) and share one ADC:
 
-- **500 kS/s total**, round-robin: 1 channel = 500 kS/s, 3 channels ≈ 166 kS/s each
+- **250 kS/s total**, round-robin: 1 channel = 250 kS/s, 3 channels ≈ 83 kS/s each
+  (the ADC conversion needs ~192 cycles at 48 MHz; higher requests are clamped)
 - **12-bit** (0.8 mV per step) or **8-bit** (13 mV per step, more stream headroom)
 - captures are either analog *or* digital at a time (the pins are switched per command)
-- streams are limited by the ~700 kB/s link: 12-bit ≈ 350 kS/s, 8-bit ≈ 500 kS/s total
+- streams: the ADC caps at 250 kS/s total; the ~700 kB/s link also fits that at 12-bit
+  for up to two channels
 
 `la acheck` measures one input and compares it with expectations, which makes it
 handy for checking lab tasks:

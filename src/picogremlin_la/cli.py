@@ -48,6 +48,7 @@ from .protocol import (SerialPort, la_capture, la_frame, la_build_capture_reques
                        mode_bps, MAX_STREAM_BYTES, clamp_rate, decode_samples,
                        stream_start, stream_stop, read_frame, LA_ID_CMD,
                        la_analog_capture, analog_stream_start, analog_channel_values,
+                       la_sync, drain_quiet,
                        adc_volts, adc_temp_c, parse_analog_channels, ANALOG_INPUTS)
 from .transport import find_ports, open_la
 
@@ -385,6 +386,12 @@ def measure_analog(vals, rate, level=None):
             "freq": freq, "duty": duty, "n": n}
 
 
+def wave_present(m, ch):
+    """A real waveform (not just ADC noise) needs a swing: ~0.16 V, or 20 counts
+    on the tiny temperature slope."""
+    return m["pp"] >= (20 if ch == 3 else 200)
+
+
 def analog_summary(vals, rate, channels, metrics=None):
     nch = len(channels)
     per = analog_channel_values(vals, nch)
@@ -396,11 +403,15 @@ def analog_summary(vals, rate, channels, metrics=None):
             print(f"  {ANALOG_INPUTS[ch]:<9} {adc_temp_c(m['mean']):6.1f} °C"
                   f"  (raw min/max {m['min']:.0f}/{m['max']:.0f})")
         else:
-            f = f"{m['freq']:>10.4g} Hz" if m["freq"] else "         —"
-            print(f"  {ANALOG_INPUTS[ch]:<9} mean {adc_volts(m['mean']):6.3f} V"
-                  f"  min {adc_volts(m['min']):6.3f}  max {adc_volts(m['max']):6.3f}"
-                  f"  pp {adc_volts(m['pp']):6.3f}  rms {adc_volts(m['rms']):6.3f}"
-                  f"  {f}  duty {m['duty']:5.1f} %")
+            f = (f"{m['freq']:>10.4g} Hz"
+                 if (m["freq"] and wave_present(m, ch)) else "         —")
+            line = (f"  {ANALOG_INPUTS[ch]:<9} mean {adc_volts(m['mean']):6.3f} V"
+                    f"  min {adc_volts(m['min']):6.3f}  max {adc_volts(m['max']):6.3f}"
+                    f"  pp {adc_volts(m['pp']):6.3f}  rms {adc_volts(m['rms']):6.3f}"
+                    f"  {f}")
+            if wave_present(m, ch):
+                line += f"  duty {m['duty']:5.1f} %"
+            print(line)
     return out
 
 

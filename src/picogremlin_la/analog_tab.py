@@ -47,84 +47,113 @@ class AnalogTab(QtWidgets.QWidget):
     # ------------------------------------------------------------- UI
     def _build(self):
         layout = QtWidgets.QVBoxLayout(self)
+        layout.setSpacing(4)
 
-        row = QtWidgets.QHBoxLayout()
         self.cb = {}
+        self.rate_cb = QtWidgets.QComboBox()
+        self.samples_sb = QtWidgets.QSpinBox()
+        self.trig_cb = QtWidgets.QCheckBox("trig")
+        self.trig_ch = QtWidgets.QComboBox()
+        self.level_edit = QtWidgets.QLineEdit("1.65V")
+        self.falling_cb = QtWidgets.QCheckBox("fall")
+        self.use_8bit = QtWidgets.QCheckBox("8-bit")
+        self.btn_single = QtWidgets.QPushButton("⚡ Single")
+        self.btn_stream = QtWidgets.QPushButton("▶ Stream")
+        self.btn_stream.setCheckable(True)
+        self.btn_save = QtWidgets.QPushButton("PNG")
+        self.btn_csv = QtWidgets.QPushButton("CSV")
+        self.chk_mean = QtWidgets.QLineEdit("1.65V±5%")
+        self.chk_freq = QtWidgets.QLineEdit()
+        self.btn_check = QtWidgets.QPushButton("Check")
+        self.check_lbl = QtWidgets.QLabel("")
+
+        # inputs
+        row = QtWidgets.QHBoxLayout()
         for ch in range(4):
-            cb = QtWidgets.QCheckBox(CHANNEL_NAMES[ch])
+            cb = QtWidgets.QCheckBox("A%d" % ch if ch < 3 else "temp")
             cb.setChecked(ch == 0)
+            cb.setToolTip(CHANNEL_NAMES[ch])
             cb.setStyleSheet(f"color: {COLORS[ch]};")
             row.addWidget(cb)
             self.cb[ch] = cb
-        row.addSpacing(12)
+        row.addStretch(1)
+        layout.addLayout(row)
+
+        # rate / samples per channel
+        row = QtWidgets.QHBoxLayout()
         row.addWidget(QtWidgets.QLabel("rate"))
-        self.rate_cb = QtWidgets.QComboBox()
         self.rate_cb.setEditable(True)
         for r in ("10k", "50k", "100k", "200k", "500k"):
             self.rate_cb.addItem(r)
         self.rate_cb.setCurrentText("100k")
-        self.rate_cb.setMaximumWidth(90)
+        self.rate_cb.setMaximumWidth(80)
         row.addWidget(self.rate_cb)
-        row.addWidget(QtWidgets.QLabel("samples/ch"))
-        self.samples_sb = QtWidgets.QSpinBox()
+        row.addWidget(QtWidgets.QLabel("n/ch"))
         self.samples_sb.setRange(16, 100000)
         self.samples_sb.setValue(4000)
         self.samples_sb.setSingleStep(1000)
+        self.samples_sb.setMaximumWidth(90)
         row.addWidget(self.samples_sb)
-        row.addSpacing(12)
-        self.trig_cb = QtWidgets.QCheckBox("trigger")
-        row.addWidget(self.trig_cb)
-        self.trig_ch = QtWidgets.QComboBox()
-        for ch in range(3):
-            self.trig_ch.addItem(CHANNEL_NAMES[ch], ch)
-        row.addWidget(self.trig_ch)
-        self.level_edit = QtWidgets.QLineEdit("1.65V")
-        self.level_edit.setMaximumWidth(80)
-        row.addWidget(self.level_edit)
-        self.falling_cb = QtWidgets.QCheckBox("falling")
-        row.addWidget(self.falling_cb)
         row.addStretch(1)
-
-        self.btn_single = QtWidgets.QPushButton("⚡ Single")
-        self.btn_stream = QtWidgets.QPushButton("▶ Stream")
-        self.btn_stream.setCheckable(True)
-        self.btn_save = QtWidgets.QPushButton("Save…")
-        self.btn_csv = QtWidgets.QPushButton("CSV")
-        for b in (self.btn_single, self.btn_stream, self.btn_save, self.btn_csv):
-            row.addWidget(b)
         layout.addLayout(row)
 
-        row2 = QtWidgets.QHBoxLayout()
-        self.use_8bit = QtWidgets.QCheckBox("8-bit (more headroom)")
-        row2.addWidget(self.use_8bit)
-        row2.addSpacing(16)
-        row2.addWidget(QtWidgets.QLabel("check mean"))
-        self.chk_mean = QtWidgets.QLineEdit("1.65V±5%")
-        self.chk_mean.setMaximumWidth(110)
-        row2.addWidget(self.chk_mean)
-        row2.addWidget(QtWidgets.QLabel("freq"))
-        self.chk_freq = QtWidgets.QLineEdit("")
-        self.chk_freq.setMaximumWidth(110)
-        row2.addWidget(self.chk_freq)
-        self.btn_check = QtWidgets.QPushButton("Check")
-        row2.addWidget(self.btn_check)
-        self.check_lbl = QtWidgets.QLabel("")
-        row2.addWidget(self.check_lbl)
-        row2.addStretch(1)
-        layout.addLayout(row2)
+        # level trigger
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(self.trig_cb)
+        for ch in range(3):
+            self.trig_ch.addItem("A%d" % ch, ch)
+        self.trig_ch.setMaximumWidth(60)
+        row.addWidget(self.trig_ch)
+        self.level_edit.setText("1.65V")
+        self.level_edit.setMaximumWidth(70)
+        row.addWidget(self.level_edit)
+        row.addWidget(self.falling_cb)
+        row.addStretch(1)
+        layout.addLayout(row)
 
-        self.plot = pg.PlotWidget()
-        self.plot.setLabel("bottom", "time", units="ms")
-        self.plot.setLabel("left", "volts", units="V")
-        self.plot.showGrid(x=True, y=True, alpha=0.25)
-        self.plot.addLegend(offset=(10, 10))
-        layout.addWidget(self.plot, 3)
+        # mode + actions
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(self.use_8bit)
+        row.addStretch(1)
+        row.addWidget(self.btn_single)
+        row.addWidget(self.btn_stream)
+        layout.addLayout(row)
 
-        self.table = QtWidgets.QTableWidget(0, 8)
+        # export
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(self.btn_csv)
+        row.addWidget(self.btn_save)
+        row.addStretch(1)
+        layout.addLayout(row)
+
+        # expectation checker
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(QtWidgets.QLabel("mean"))
+        self.chk_mean.setText("1.65V±5%")
+        self.chk_mean.setMaximumWidth(80)
+        row.addWidget(self.chk_mean)
+        row.addWidget(QtWidgets.QLabel("freq"))
+        self.chk_freq.setMaximumWidth(80)
+        row.addWidget(self.chk_freq)
+        row.addWidget(self.btn_check)
+        row.addStretch(1)
+        layout.addLayout(row)
+        self.check_lbl.setWordWrap(True)
+        layout.addWidget(self.check_lbl)
+
+        self.table = QtWidgets.QTableWidget(0, 5)
+        self.table.setColumnCount(5)
         self.table.setHorizontalHeaderLabels(
-            ["input", "mean", "min", "max", "pp", "rms", "freq", "duty"])
+            ["input", "mean", "min/max", "pp/rms", "freq · duty"])
         self.table.verticalHeader().setVisible(False)
         self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.horizontalHeader().setSectionResizeMode(
+            QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.table.setEditTriggers(
+            QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        tf = self.table.font()
+        tf.setPointSizeF(8.0)
+        self.table.setFont(tf)
         layout.addWidget(self.table, 1)
 
         self.btn_single.clicked.connect(self.single)
@@ -132,6 +161,11 @@ class AnalogTab(QtWidgets.QWidget):
         self.btn_save.clicked.connect(self.save_png)
         self.btn_csv.clicked.connect(self.save_csv)
         self.btn_check.clicked.connect(self.check)
+
+    @property
+    def plot(self):
+        """The shared analog plot owned by the main window (created after us)."""
+        return self.win.analog_plot
 
     # ---------------------------------------------------------- helpers
     def _selected(self):
@@ -146,6 +180,15 @@ class AnalogTab(QtWidgets.QWidget):
 
     # ---------------------------------------------------------- single shot
     def single(self):
+        if getattr(self, "_busy", False):
+            self._set_status("analog: capture already in flight — wait for it")
+            return
+        # a digital single-shot or stream owns the LA port: cancel it first
+        if hasattr(self.win, "rearm_timer"):
+            self.win.rearm_timer.stop()
+        if getattr(self.win, "arming", False) or getattr(self.win, "running", False):
+            self.win.stop()
+            time.sleep(0.1)
         port = self._port()
         if port is None:
             self._set_status("analog: no probe")
@@ -164,17 +207,24 @@ class AnalogTab(QtWidgets.QWidget):
         eight = self.use_8bit.isChecked()
 
         def worker():
-            res = la.la_analog_capture(port, chans, rate, 0, post,
-                                       eight_bit=eight, trigger=trig,
-                                       level=level,
-                                       inverted=self.falling_cb.isChecked(),
-                                       head_timeout=5.0)
+            res = {"ok": False, "response": "exception"}
+            try:
+                res = la.la_analog_capture(port, chans, rate, 0, post,
+                                           eight_bit=eight, trigger=trig,
+                                           level=level,
+                                           inverted=self.falling_cb.isChecked(),
+                                           head_timeout=5.0)
+            except Exception as exc:                # never leave the tab busy
+                res = {"ok": False, "response": str(exc)[:60]}
+            finally:
+                self._busy = False
             if not res["ok"] and port:
                 port.write(b"\xff")
                 port.flush()
                 port.drain(0.5)
             self.capture_done.emit((res, chans, rate))
 
+        self._busy = True
         self._set_status("analog: capturing…")
         threading.Thread(target=worker, daemon=True).start()
 
@@ -194,31 +244,41 @@ class AnalogTab(QtWidgets.QWidget):
         per = la.analog_channel_values(self.values, len(chans))
         t = np.arange(len(per[0])) / rate * 1e3
         self.plot.clear()
+        curves = []
         for k, ch in enumerate(chans):
             y = np.array([la.adc_temp_c(v) if ch == 3 else la.adc_volts(v)
                           for v in per[k]])
-            self.plot.plot(t, y, pen=pg.mkPen(COLORS[ch], width=1.4),
-                           name=CHANNEL_NAMES[ch])
+            curves.append(y)
+            self.plot.plot(t, y, pen=pg.mkPen(COLORS[ch], width=1.4))
+        # a flat signal must still be visible: pyqtgraph's auto-range collapses
+        # to zero span when min == max
         if chans == [3]:
-            self.plot.setLabel("left", "°C")
+            self.plot.setLabel("left", "temperature", units="°C")
+            m = float(np.mean(curves[0]))
+            self.plot.setYRange(m - 3.0, m + 3.0, padding=0)
         else:
             self.plot.setLabel("left", "volts", units="V")
+            self.plot.setYRange(0.0, 3.3, padding=0)
+        self.plot.setVisible(True)
         self._fill_table(per, chans, rate)
 
     def _fill_table(self, per, chans, rate):
         self.table.setRowCount(len(chans))
         for k, ch in enumerate(chans):
             m = la.measure_analog(per[k], rate)
-            cells = [
-                CHANNEL_NAMES[ch],
-                f"{la.adc_temp_c(m['mean']):.1f} °C" if ch == 3 else f"{la.adc_volts(m['mean']):.3f} V",
-                f"{m['min']:.0f}" if ch == 3 else f"{la.adc_volts(m['min']):.3f} V",
-                f"{m['max']:.0f}" if ch == 3 else f"{la.adc_volts(m['max']):.3f} V",
-                f"{m['pp']:.0f}" if ch == 3 else f"{la.adc_volts(m['pp']):.3f} V",
-                f"{m['rms']:.0f}" if ch == 3 else f"{la.adc_volts(m['rms']):.3f} V",
-                f"{m['freq']:.4g} Hz" if m["freq"] else "—",
-                f"{m['duty']:.1f} %" if m["freq"] else "—",
-            ]
+            if ch == 3:
+                cells = [CHANNEL_NAMES[ch],
+                         f"{la.adc_temp_c(m['mean']):.1f} °C",
+                         f"{m['min']:.0f}/{m['max']:.0f}",
+                         f"{m['pp']:.0f}/{m['rms']:.0f}",
+                         "—"]
+            else:
+                cells = [CHANNEL_NAMES[ch],
+                         f"{la.adc_volts(m['mean']):.3f} V",
+                         f"{la.adc_volts(m['min']):.2f}/{la.adc_volts(m['max']):.2f}",
+                         f"{la.adc_volts(m['pp']):.3f}/{la.adc_volts(m['rms']):.2f}",
+                         (f"{m['freq']:.4g} Hz · {m['duty']:.0f} %"
+                          if (m["freq"] and la.wave_present(m, ch)) else "—")]
             for col, text in enumerate(cells):
                 item = QtWidgets.QTableWidgetItem(text)
                 item.setFlags(item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
@@ -232,8 +292,10 @@ class AnalogTab(QtWidgets.QWidget):
             self._stop_stream()
 
     def _start_stream(self):
-        if getattr(self.win, "running", False):
-            self.win.stop_quiet()          # both streams share the LA CDC
+        if hasattr(self.win, "rearm_timer"):
+            self.win.rearm_timer.stop()
+        if getattr(self.win, "arming", False) or getattr(self.win, "running", False):
+            self.win.stop()                # both streams share the LA CDC
         port = self._port()
         chans = self._selected()
         if port is None or not chans:

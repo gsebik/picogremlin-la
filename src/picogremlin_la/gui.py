@@ -397,6 +397,10 @@ class ScopeWindow(QtWidgets.QMainWindow):
         # connect once here: connecting per one_shot() call would stack
         # duplicate connections and fire _show_oneshot N times per capture
         self.oneshot_done.connect(self._show_oneshot)
+        self.oneshot_thread = None
+        self.rearm_timer = QtCore.QTimer(self)
+        self.rearm_timer.setSingleShot(True)
+        self.rearm_timer.timeout.connect(self.one_shot)
 
         self._build_ui()
         self.setMinimumSize(1300, 800)
@@ -626,6 +630,7 @@ class ScopeWindow(QtWidgets.QMainWindow):
         self.analog_tab = analog_tab.AnalogTab(self)
         self.tabs.addTab(self.analog_tab, "analog")
 
+        self.tabs.currentChanged.connect(self._tab_changed)
         sv.addWidget(self.tabs, 1)
         side.setFixedWidth(340)
 
@@ -673,7 +678,23 @@ class ScopeWindow(QtWidgets.QMainWindow):
         rv = QtWidgets.QVBoxLayout(right)
         rv.setContentsMargins(0, 0, 0, 0)
         rv.setSpacing(0)
-        rv.addWidget(self.plot, 1)
+        # analog traces live in a second plot under the digital one, with the
+        # same time axis (x-linked), so a capture reads as one screen
+        self.analog_plot = pg.PlotWidget()
+        self.analog_plot.setXLink(self.plot)
+        self.analog_plot.showGrid(x=True, y=True, alpha=0.25)
+        self.analog_plot.setLabel("left", "volts", units="V")
+        self.analog_plot.setLabel("bottom", "time (ms)")
+        self.analog_plot.getAxis("left").setWidth(150)
+        self.analog_plot.setVisible(False)
+        self.plot.getAxis("bottom").setStyle(showValues=False)
+        split = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
+        split.addWidget(self.plot)
+        split.addWidget(self.analog_plot)
+        split.setStretchFactor(0, 3)
+        split.setStretchFactor(1, 1)
+        split.setSizes([700, 240])
+        rv.addWidget(split, 1)
         self.meas_lbl = QtWidgets.QLabel()
         self.meas_lbl.setTextFormat(QtCore.Qt.TextFormat.RichText)
         self.meas_lbl.setStyleSheet("color:#8b949e; padding:3px 6px;")
@@ -1237,6 +1258,7 @@ class ScopeWindow(QtWidgets.QMainWindow):
 
     # -------------------------------------------------------------- stream
     def start(self):
+        self.rearm_timer.stop()
         if getattr(self, "analog_tab", None) and self.analog_tab.streaming:
             self.analog_tab.btn_stream.setChecked(False)
         if self.port is None:
@@ -1433,8 +1455,16 @@ class ScopeWindow(QtWidgets.QMainWindow):
         if not self.running:
             self.status.showMessage(f"window {vals[i]:g} ms")
 
+    def _tab_changed(self, _index):
+        try:
+            active = self.tabs.currentWidget() is self.analog_tab
+        except AttributeError:
+            active = False
+        self.analog_plot.setVisible(active or bool(getattr(self.analog_tab, "values", [])))
+
     def stop(self):
         self.auto_single = False
+        self.rearm_timer.stop()
         if self.btn_collect.isChecked():
             self.btn_collect.setChecked(False)
         if self.arming:
@@ -1442,6 +1472,10 @@ class ScopeWindow(QtWidgets.QMainWindow):
                 self.port.write(b"\xff")
                 self.port.flush()
             self.arming = False
+            th = getattr(self, "oneshot_thread", None)
+            if th is not None:
+                th.join(timeout=2.0)       # let the worker release the port
+                self.oneshot_thread = None
             self._set_state("stopped")
             self.status.showMessage("single-shot cancelled")
             return
@@ -1528,12 +1562,17 @@ class ScopeWindow(QtWidgets.QMainWindow):
                 self.port.drain(0.5)
             self.oneshot_done.emit((res, rate, pre))
 
-        threading.Thread(target=worker, daemon=True).start()
+        self.oneshot_thread = threading.Thread(target=worker, daemon=True)
+        self.oneshot_thread.start()
 
     def _show_oneshot(self, args):
         res, rate, pre = args
+        was_armed = self.arming
         self.arming = False
+        self.oneshot_thread = None
         if not res.get("ok"):
+            if not was_armed:              # cancelled by Stop: keep its status
+                return
             self._set_state("stopped")
             self.auto_single = False
             t = self.cb_trig.currentData()
@@ -1567,7 +1606,7 @@ class ScopeWindow(QtWidgets.QMainWindow):
             + ("re-arming for the next trigger (Stop ends it)"
                if self.auto_single else "⚡ Single re-arms"))
         if self.auto_single:
-            QtCore.QTimer.singleShot(250, self.one_shot)
+            self.rearm_timer.start(250)
 
     # ------------------------------------------------------------- drawing
     def tick(self):
@@ -2008,18 +2047,6 @@ def main(argv=None):
 
     win = ScopeWindow()
     if args.smoke:
-        win.persist = False        # don't overwrite the user's saved settings
-        win.pins.set_selection([16, 17])
-        for i in range(win.cb_trig.count()):
-            if win.cb_trig.itemData(i) == 16:
-                win.cb_trig.setCurrentIndex(i)
-        win.fit_btn.setChecked(True)
-        win.sb_pre.setValue(0.5)
-        win.sb_post.setValue(20.0)
-        win._pins_changed()
-    win.show()
-
-    if args.smoke:
         result = {"ok": False}
 
         def grab(name):
@@ -2028,11 +2055,63 @@ def main(argv=None):
                 win.grab().save(path)
                 print(f"grab: {path}", flush=True)
 
+        # ---- analog phases first: the LA link is clean, no digital capture queued
+        def analog_synthetic():
+            at = win.analog_tab
+            rate, n = 100_000, 4000
+            vals = []
+            for i in range(n):
+                vals += [int(2048 + 800 * math.sin(2 * math.pi * 1000 * i / rate)), 2348]
+            at._render(vals, [0, 1], rate)
+            at.chk_mean.setText("1.65V±5%")
+            at.check()
+            print(f"smoke4: analog rows={at.table.rowCount()} "
+                  f"A0 mean={at.table.item(0, 1).text()} freq={at.table.item(0, 4).text()} "
+                  f"| A1 mean={at.table.item(1, 1).text()} "
+                  f"| check='{at.check_lbl.text()}'", flush=True)
+            win.tabs.setCurrentWidget(at)
+            grab("analog")
+
+        def after_analog_stream():
+            at = win.analog_tab
+            at.btn_stream.setChecked(False)
+            per = len(at._stream_vals) // max(1, len(getattr(at, "_stream_chans", [1])))
+            print(f"smoke6: analog stream frames={at.frames} samples/ch={per} "
+                  f"status='{win.status.currentMessage()}'", flush=True)
+            grab("analog_stream")
+            QtCore.QTimer.singleShot(300, phase_stream)
+
+        def after_analog():
+            at = win.analog_tab
+            print(f"smoke5: analog live capture rows={at.table.rowCount()} "
+                  f"A0 mean={at.table.item(0, 1).text() if at.table.rowCount() else '-'} "
+                  f"status='{win.status.currentMessage()}'", flush=True)
+            grab("analog_live")
+            at.btn_stream.setChecked(True)          # exercise the analog stream
+            QtCore.QTimer.singleShot(1500, after_analog_stream)
+
+        def phase_analog():
+            if win.port is not None:
+                win.stop()                          # release any armed capture
+                for _ in range(10):                 # and wait for a clean parser
+                    if la.la_sync(win.port):
+                        break
+                    time.sleep(0.2)
+            analog_synthetic()
+            if win.port is None:
+                print("smoke5: no probe — analog live capture skipped", flush=True)
+                QtCore.QTimer.singleShot(200, phase_stream)
+                return
+            win.analog_tab.single()
+            QtCore.QTimer.singleShot(2500, after_analog)
+
         def phase_stream():
             for i in range(win.cb_trig.count()):
                 if win.cb_trig.itemData(i) == 16:
                     win.cb_trig.setCurrentIndex(i)
             win.cb_rate.setCurrentText("2M")
+            win.cb_win.setCurrentText("10")      # deterministic smoke timebase
+            win.store_btn.setChecked(True)       # record the synthetic captures
             if win.port is None:
                 print(f"smoke0: no probe — synthetic phases only "
                       f"(device='{win.dev_lbl.text()}')", flush=True)
@@ -2084,6 +2163,8 @@ def main(argv=None):
 
             win.stop()
             win.btn_collect.setChecked(False)
+            win.pins.set_selection([16, 17])     # deterministic smoke channels
+            win._pins_changed()
             win.clear_results()
             for widths in ([3, 5, 4], [2, 2, 6], [4]):
                 samples = synth(widths)
@@ -2101,53 +2182,10 @@ def main(argv=None):
             win.tabs.setCurrentIndex(1)
             grab("results")
 
-            # phase 4: analog tab — synthetic sine + DC, no probe needed
-            at = win.analog_tab
-            rate, n = 100_000, 4000
-            vals = []
-            for i in range(n):
-                vals += [int(2048 + 800 * math.sin(2 * math.pi * 1000 * i / rate)),
-                         2348]
-            at._render(vals, [0, 1], rate)
-            at.chk_mean.setText("1.65V±5%")
-            at.check()
-            print(f"smoke4: analog rows={at.table.rowCount()} "
-                  f"A0 mean={at.table.item(0, 1).text()} freq={at.table.item(0, 6).text()} "
-                  f"| A1 mean={at.table.item(1, 1).text()} "
-                  f"| check='{at.check_lbl.text()}'", flush=True)
-            win.tabs.setCurrentWidget(at)
-            grab("analog")
 
-            def after_analog_stream():
-                at.btn_stream.setChecked(False)
-                per = len(at._stream_vals) // max(1, len(getattr(at, "_stream_chans", [1])))
-                print(f"smoke6: analog stream frames={at.frames} samples/ch={per} "
-                      f"status='{win.status.currentMessage()}'", flush=True)
-                grab("analog_stream")
-                result["ok"] = True
-                app.quit()
+        QtCore.QTimer.singleShot(300, phase_analog)
 
-            def after_analog():
-                print(f"smoke5: analog live capture rows={at.table.rowCount()} "
-                      f"A0 mean={at.table.item(0, 1).text() if at.table.rowCount() else '-'} "
-                      f"status='{win.status.currentMessage()}'", flush=True)
-                grab("analog_live")
-                at.btn_stream.setChecked(True)          # exercise the analog stream
-                QtCore.QTimer.singleShot(1500, after_analog_stream)
-
-            def phase_analog():
-                if win.port is None:
-                    print("smoke5: no probe — analog live capture skipped", flush=True)
-                    result["ok"] = True
-                    app.quit()
-                    return
-                at.single()
-                QtCore.QTimer.singleShot(2500, after_analog)
-
-            QtCore.QTimer.singleShot(300, phase_analog)
-
-        QtCore.QTimer.singleShot(300, phase_stream)
-
+    win.show()
     app.exec()
     sys.exit(0 if not args.smoke or result["ok"] else 1)
 

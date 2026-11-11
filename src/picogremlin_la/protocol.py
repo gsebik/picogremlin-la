@@ -539,13 +539,47 @@ def drain_quiet(port, quiet=0.15, max_time=2.0):
             return
 
 
+def la_sync(port, timeout=2.0):
+    """Ping the LA with the identity command: consumes any payload still in
+    flight and proves the command parser is in a known state."""
+    drain_quiet(port, quiet=0.1, max_time=0.6)
+    port.write(LA_ID_CMD)
+    port.flush()
+    ok = b"CHANNELS:24" in port.read_until(b"CHANNELS:24", timeout=timeout,
+                                           maxlen=4096)
+    drain_quiet(port, quiet=0.1, max_time=0.6)
+    return ok
+
+
 def la_analog_capture(port, channels, rate, pre, post, eight_bit=False,
                       trigger=None, level=0, inverted=False,
-                      head_timeout=10.0, data_timeout=30.0, drain=0.3):
+                      head_timeout=10.0, data_timeout=30.0, drain=0.3,
+                      retries=1):
+    """CMD 0x49 with one recovery retry: a capture that was armed (or a stream
+    that was just stopped) can swallow the first request; cancel and retry."""
+    res = None
+    for attempt in range(retries + 1):
+        if attempt:
+            port.write(b"\xff")                 # cancel whatever is still armed
+            port.flush()
+            drain_quiet(port, quiet=0.15, max_time=1.0)
+            la_sync(port)                        # resync the parser, then retry
+        res = _la_analog_capture_once(port, channels, rate, pre, post, eight_bit,
+                                      trigger, level, inverted, head_timeout,
+                                      data_timeout, drain)
+        if res.get("ok"):
+            return res
+    return res
+
+
+def _la_analog_capture_once(port, channels, rate, pre, post, eight_bit,
+                            trigger, level, inverted, head_timeout,
+                            data_timeout, drain):
     """CMD 0x49 — one-shot ADC capture.
 
     channels: ADC inputs (0..2 external, 3 = temperature)
-    rate:     requested per-channel sample rate (total is clamped to 500 kS/s)
+    rate:     requested per-channel sample rate (total is clamped to 250 kS/s;
+              the reply's `rate` is the achieved per-channel rate)
     pre/post: samples per channel before/after the trigger
     trigger:  ADC input to trigger on, or None to capture immediately
     level:    12-bit threshold for the trigger
