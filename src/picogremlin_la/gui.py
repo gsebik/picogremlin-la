@@ -2181,7 +2181,8 @@ def main(argv=None):
             print(f"smoke3 summary: {win.summary_lbl.text()}", flush=True)
             win.tabs.setCurrentIndex(1)
             grab("results")
-
+            result["ok"] = True
+            app.quit()
 
         QtCore.QTimer.singleShot(300, phase_analog)
 

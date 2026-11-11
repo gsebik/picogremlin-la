@@ -48,7 +48,7 @@ from .protocol import (SerialPort, la_capture, la_frame, la_build_capture_reques
                        mode_bps, MAX_STREAM_BYTES, clamp_rate, decode_samples,
                        stream_start, stream_stop, read_frame, LA_ID_CMD,
                        la_analog_capture, analog_stream_start, analog_channel_values,
-                       la_sync, drain_quiet,
+                       la_sync, drain_quiet, ADC_VREF,
                        adc_volts, adc_temp_c, parse_analog_channels, ANALOG_INPUTS)
 from .transport import find_ports, open_la
 

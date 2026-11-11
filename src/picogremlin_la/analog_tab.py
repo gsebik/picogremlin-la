@@ -38,6 +38,8 @@ class AnalogTab(QtWidgets.QWidget):
         self.streaming = False
         self._stream_buf = bytearray()
         self._stream_vals = []
+        self._stream_chunks = []
+        self._curve_items = []
         self._stream_t0 = 0.0
         self._timer = QtCore.QTimer(self)
         self._timer.timeout.connect(self._poll_stream)
@@ -237,30 +239,60 @@ class AnalogTab(QtWidgets.QWidget):
         self._set_status(f"analog: {len(res['values']) // len(chans)} samples/ch "
                          f"@ {res['rate'] / 1e3:g} kS/s")
 
-    def _render(self, values, chans, rate):
-        self.values = list(values)
+    def _render(self, values, chans, rate, measure=True):
+        self.values = values if isinstance(values, np.ndarray) else np.asarray(values)
         self.channels = list(chans)
         self.rate = rate
-        per = la.analog_channel_values(self.values, len(chans))
-        t = np.arange(len(per[0])) / rate * 1e3
-        self.plot.clear()
-        curves = []
+        nch = len(chans)
+        v = self.values
+        n = len(v) // nch
+        idx = np.arange(n)
+        t = idx / rate * 1e3
+        scale = 1.0 if self.use_8bit.isChecked() and v.dtype == np.uint8 else 1.0
+        # vectorised raw -> volts / °C
+        if v.dtype == np.uint8:
+            volts = v.astype(np.float32) * 16.0 * la.ADC_VREF / 4096.0
+        else:
+            volts = v.astype(np.float32) * la.ADC_VREF / 4096.0
+        # rebuild the curves only when the channel set changes
+        key = tuple(chans)
+        if getattr(self, "_curve_key", None) != key:
+            self.plot.clear()
+            self._curve_items = []
+            for ch in chans:
+                self._curve_items.append(
+                    self.plot.plot([], [], pen=pg.mkPen(COLORS[ch], width=1.4)))
+            self._curve_key = key
         for k, ch in enumerate(chans):
-            y = np.array([la.adc_temp_c(v) if ch == 3 else la.adc_volts(v)
-                          for v in per[k]])
-            curves.append(y)
-            self.plot.plot(t, y, pen=pg.mkPen(COLORS[ch], width=1.4))
-        # a flat signal must still be visible: pyqtgraph's auto-range collapses
-        # to zero span when min == max
+            y = volts[k::nch]
+            if ch == 3:
+                y = 27.0 - (y - 0.706) / 0.001721
+            # min/max decimation keeps glitches visible on long windows
+            if len(y) > 20000:
+                m = (len(y) // 20000) * 20000
+                yb = y[:m].reshape(-1, 20000)
+                lo, hi = yb.min(axis=1), yb.max(axis=1)
+                xb = t[:m:20000]
+                xs = np.repeat(xb, 2)
+                ys = np.empty(len(lo) * 2, dtype=np.float32)
+                ys[0::2], ys[1::2] = lo, hi
+                self._curve_items[k].setData(xs, ys)
+            else:
+                self._curve_items[k].setData(t, y)
         if chans == [3]:
             self.plot.setLabel("left", "temperature", units="°C")
-            m = float(np.mean(curves[0]))
+            m = float(np.mean(volts))
             self.plot.setYRange(m - 3.0, m + 3.0, padding=0)
         else:
             self.plot.setLabel("left", "volts", units="V")
             self.plot.setYRange(0.0, 3.3, padding=0)
         self.plot.setVisible(True)
-        self._fill_table(per, chans, rate)
+        if measure:
+            # measure at most the newest 50k values: the table is a summary, and
+            # a Python pass over a 20 s stream would stall the UI
+            win = v[-50000 * nch:] if len(v) > 50000 * nch else v
+            per = la.analog_channel_values(win.tolist(), nch)
+            self._fill_table(per, chans, rate)
 
     def _fill_table(self, per, chans, rate):
         self.table.setRowCount(len(chans))
@@ -315,6 +347,7 @@ class AnalogTab(QtWidgets.QWidget):
             return
         self._stream_buf = leftover
         self._stream_vals = []
+        self._stream_chunks = []
         self._stream_chans = chans
         self._stream_rate = rate_rep
         self._stream_t0 = time.monotonic()
@@ -334,7 +367,7 @@ class AnalogTab(QtWidgets.QWidget):
                 la.stream_stop(port)
             except Exception:
                 pass
-        if self._stream_vals:
+        if len(self._stream_vals):
             self._render(self._stream_vals, self._stream_chans, self._stream_rate)
             self._set_status(f"analog: stopped after {len(self._stream_vals) // len(self._stream_chans)} "
                              f"samples/ch")
@@ -349,20 +382,22 @@ class AnalogTab(QtWidgets.QWidget):
                 break
             self.frames += 1
             if self.use_8bit.isChecked():
-                self._stream_vals.extend(data)
+                self._stream_chunks.append(np.frombuffer(data, dtype=np.uint8))
             else:
-                self._stream_vals.extend(
-                    np.frombuffer(data, dtype="<u2").tolist())
-        # keep the live view bounded (~20 s of data)
-        cap = 4 * self._stream_rate * 20
-        if len(self._stream_vals) > cap:
-            del self._stream_vals[:len(self._stream_vals) - cap]
-        if self._stream_vals:
-            self._render(self._stream_vals, self._stream_chans, self._stream_rate)
+                self._stream_chunks.append(np.frombuffer(data, dtype="<u2"))
+        # keep the live view bounded (~20 s of data), newest chunks last
+        cap = self._stream_rate * 20
+        total = sum(len(c) for c in self._stream_chunks)
+        while total > cap and len(self._stream_chunks) > 1:
+            total -= len(self._stream_chunks.pop(0))
+        if self._stream_chunks:
+            self._stream_vals = np.concatenate(self._stream_chunks)
+            self._render(self._stream_vals, self._stream_chans, self._stream_rate,
+                         measure=False)
 
     # ---------------------------------------------------------- check
     def check(self):
-        if not self.values:
+        if self.values is None or len(self.values) == 0:
             self._set_status("analog: capture first")
             return
         ch = self.channels[0]
@@ -393,7 +428,7 @@ class AnalogTab(QtWidgets.QWidget):
 
     # ---------------------------------------------------------- export
     def save_png(self):
-        if not self.values:
+        if self.values is None or len(self.values) == 0:
             self._set_status("analog: nothing to save")
             return
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
@@ -403,7 +438,7 @@ class AnalogTab(QtWidgets.QWidget):
             self._set_status(f"wrote {path}")
 
     def save_csv(self):
-        if not self.values:
+        if self.values is None or len(self.values) == 0:
             self._set_status("analog: nothing to save")
             return
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
